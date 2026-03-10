@@ -16,10 +16,34 @@ import (
 	"github.com/miekg/dns"
 )
 
+// Block categories
+type Category string
+
+const (
+	CategoryAds       Category = "ads"
+	CategorySocial    Category = "social"
+	CategoryGaming    Category = "gaming"
+	CategoryStreaming Category = "streaming"
+	CategoryCustom    Category = "custom"
+)
+
 var defaultBlocklists = []string{
 	"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 	"https://adaway.org/hosts.txt",
-	"https://v.firebog.net/hosts/Easylist.txt",
+}
+
+// App blocker lists by category
+var appBlocklists = map[Category][]string{
+	CategorySocial: {
+		"https://raw.githubusercontent.com/jerryn70/Social-media-Blocklist/master/Social-media-Blocklist.txt",
+		"https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social-only/hosts",
+	},
+	CategoryGaming: {
+		"https://raw.githubusercontent.com/jerryn70/Gaming-Blocklist/master/Gaming-Blocklist.txt",
+	},
+	CategoryStreaming: {
+		"https://raw.githubusercontent.com/jerryn70/Streaming-Blocklist/master/Streaming-Blocklist.txt",
+	},
 }
 
 type LogEntry struct {
@@ -27,38 +51,50 @@ type LogEntry struct {
 	Domain    string `json:"domain"`
 	Type      string `json:"type"`
 	Action    string `json:"action"`
+	Category  string `json:"category"`
 	ClientIP  string `json:"client_ip"`
 	Reason    string `json:"reason,omitempty"`
+	AppName   string `json:"app_name,omitempty"`
+}
+
+type BlockConfig struct {
+	Ads       bool `json:"ads"`
+	Social    bool `json:"social"`
+	Gaming    bool `json:"gaming"`
+	Streaming bool `json:"streaming"`
+	Custom    bool `json:"custom"`
 }
 
 type Config struct {
-	Port        string   `json:"port"`
-	UpstreamDNS []string `json:"upstream_dns"`
-	Blocklists  []string `json:"blocklists"`
-	Whitelist   []string `json:"whitelist"`
-	CacheSize   int      `json:"cache_size"`
+	Port        string      `json:"port"`
+	UpstreamDNS []string    `json:"upstream_dns"`
+	Blocklists  []string    `json:"blocklists"`
+	Whitelist   []string    `json:"whitelist"`
+	CacheSize   int         `json:"cache_size"`
+	BlockConfig BlockConfig `json:"block_config"`
 }
 
 type Server struct {
-	config    Config
-	blocklist map[string]bool
-	whitelist map[string]bool
-	cache     *Cache
-	upstream  []string
-	mu        sync.RWMutex
-	stats     Stats
-	startTime time.Time
-	logs      []LogEntry
-	logsMu    sync.RWMutex
-	maxLogs   int
-	clients   map[chan LogEntry]bool
-	clientsMu sync.RWMutex
+	config     Config
+	blocklists map[Category]map[string]bool // category -> domains
+	whitelist  map[string]bool
+	cache      *Cache
+	upstream   []string
+	mu         sync.RWMutex
+	stats      Stats
+	startTime  time.Time
+	logs       []LogEntry
+	logsMu     sync.RWMutex
+	maxLogs    int
+	clients    map[chan LogEntry]bool
+	clientsMu  sync.RWMutex
 }
 
 type Stats struct {
-	TotalQueries   int64 `json:"total_queries"`
-	BlockedQueries int64 `json:"blocked_queries"`
-	CachedQueries  int64 `json:"cached_queries"`
+	TotalQueries   int64            `json:"total_queries"`
+	BlockedQueries int64            `json:"blocked_queries"`
+	CachedQueries  int64            `json:"cached_queries"`
+	ByCategory     map[string]int64 `json:"by_category"`
 }
 
 type Cache struct {
@@ -110,15 +146,18 @@ func NewServer(config Config) *Server {
 	}
 
 	return &Server{
-		config:    config,
-		blocklist: make(map[string]bool),
-		whitelist: whitelist,
-		cache:     NewCache(config.CacheSize),
-		upstream:  config.UpstreamDNS,
-		startTime: time.Now(),
-		logs:      make([]LogEntry, 0),
-		maxLogs:   1000,
-		clients:   make(map[chan LogEntry]bool),
+		config:     config,
+		blocklists: make(map[Category]map[string]bool),
+		whitelist:  whitelist,
+		cache:      NewCache(config.CacheSize),
+		upstream:   config.UpstreamDNS,
+		startTime:  time.Now(),
+		logs:       make([]LogEntry, 0),
+		maxLogs:    1000,
+		clients:    make(map[chan LogEntry]bool),
+		stats: Stats{
+			ByCategory: make(map[string]int64),
+		},
 	}
 }
 
@@ -140,23 +179,61 @@ func (s *Server) addLog(entry LogEntry) {
 	s.clientsMu.RUnlock()
 }
 
-func (s *Server) loadBlocklists() error {
-	log.Println("Fetching blocklists...")
-	newBlocklist := make(map[string]bool)
+func (s *Server) loadAllBlocklists() error {
+	log.Println("Loading all blocklists...")
 
-	for _, url := range s.config.Blocklists {
-		log.Printf("Loading: %s", url)
-		if err := s.fetchBlocklist(url, newBlocklist); err != nil {
-			log.Printf("Failed to load %s: %v", url, err)
+	// Load ads blocklists
+	if s.config.BlockConfig.Ads {
+		if err := s.loadCategory(CategoryAds, s.config.Blocklists); err != nil {
+			log.Printf("Failed to load ads blocklists: %v", err)
+		}
+	}
+
+	// Load social media
+	if s.config.BlockConfig.Social {
+		if err := s.loadCategory(CategorySocial, appBlocklists[CategorySocial]); err != nil {
+			log.Printf("Failed to load social blocklists: %v", err)
+		}
+	}
+
+	// Load gaming
+	if s.config.BlockConfig.Gaming {
+		if err := s.loadCategory(CategoryGaming, appBlocklists[CategoryGaming]); err != nil {
+			log.Printf("Failed to load gaming blocklists: %v", err)
+		}
+	}
+
+	// Load streaming
+	if s.config.BlockConfig.Streaming {
+		if err := s.loadCategory(CategoryStreaming, appBlocklists[CategoryStreaming]); err != nil {
+			log.Printf("Failed to load streaming blocklists: %v", err)
+		}
+	}
+
+	// Log summary
+	s.mu.RLock()
+	for cat, domains := range s.blocklists {
+		log.Printf("Category %s: %d domains blocked", cat, len(domains))
+	}
+	s.mu.RUnlock()
+
+	return nil
+}
+
+func (s *Server) loadCategory(cat Category, urls []string) error {
+	domains := make(map[string]bool)
+
+	for _, url := range urls {
+		if err := s.fetchBlocklist(url, domains); err != nil {
+			log.Printf("Failed to fetch %s: %v", url, err)
 			continue
 		}
 	}
 
 	s.mu.Lock()
-	s.blocklist = newBlocklist
+	s.blocklists[cat] = domains
 	s.mu.Unlock()
 
-	log.Printf("Loaded %d blocked domains", len(newBlocklist))
 	return nil
 }
 
@@ -207,50 +284,71 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 			domain = strings.TrimPrefix(domain, "www.")
 			blocklist[domain] = true
 		}
-
-		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
-			urlParts := strings.SplitN(line, "/", 3)
-			if len(urlParts) >= 2 {
-				domain := strings.ToLower(strings.Replace(urlParts[2], "www.", "", 1))
-				blocklist[domain] = true
-			}
-		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	log.Printf("Processed %d lines from %s", lineCount, url)
-	return nil
+	log.Printf("Loaded %d domains from %s", len(blocklist), url)
+	return scanner.Err()
 }
 
-func (s *Server) isBlocked(domain string) bool {
+func (s *Server) checkBlock(domain string) (bool, Category, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 
 	if s.whitelist[domain] {
-		return false
-	}
-	if s.blocklist[domain] {
-		return true
+		return false, "", "whitelisted"
 	}
 
-	parts := strings.Split(domain, ".")
-	for i := 1; i < len(parts)-1; i++ {
-		parent := strings.Join(parts[i:], ".")
-		if s.blocklist[parent] {
-			return true
+	// Check each category
+	for cat, domains := range s.blocklists {
+		// Exact match
+		if domains[domain] {
+			return true, cat, "exact match"
+		}
+
+		// Subdomain match
+		parts := strings.Split(domain, ".")
+		for i := 1; i < len(parts); i++ {
+			parent := strings.Join(parts[i:], ".")
+			if domains[parent] {
+				return true, cat, "parent domain"
+			}
 		}
 	}
-	return false
+
+	return false, "", ""
 }
 
-func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool, string) {
+func (s *Server) getAppName(domain string) string {
+	// Map domains to app names for better logging
+	appMap := map[string]string{
+		"roblox.com":     "Roblox",
+		"rbxcdn.com":     "Roblox",
+		"facebook.com":   "Facebook",
+		"instagram.com":  "Instagram",
+		"twitter.com":    "Twitter/X",
+		"x.com":          "Twitter/X",
+		"tiktok.com":     "TikTok",
+		"youtube.com":    "YouTube",
+		"discord.com":    "Discord",
+		"discordapp.com": "Discord",
+		"epicgames.com":  "Epic Games",
+		"fortnite.com":   "Fortnite",
+		"minecraft.net":  "Minecraft",
+	}
+
+	for d, app := range appMap {
+		if strings.Contains(domain, d) {
+			return app
+		}
+	}
+	return ""
+}
+
+func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool, string, Category) {
 	if len(msg.Question) == 0 {
-		return msg, false, "no question"
+		return msg, false, "no question", ""
 	}
 
 	question := msg.Question[0]
@@ -262,6 +360,7 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 
 	s.stats.TotalQueries++
 
+	// Check cache
 	cacheKey := fmt.Sprintf("%s:%d", domain, question.Qtype)
 	if cached, found := s.cache.Get(cacheKey); found {
 		s.stats.CachedQueries++
@@ -277,28 +376,36 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 			ClientIP:  clientIP,
 		})
 
-		return cachedMsg, true, "cache hit"
+		return cachedMsg, true, "cache hit", ""
 	}
 
-	if s.isBlocked(domain) {
+	// Check blocklists
+	blocked, category, reason := s.checkBlock(domain)
+	if blocked {
 		s.stats.BlockedQueries++
+		s.stats.ByCategory[string(category)]++
+
 		msg.Rcode = dns.RcodeNameError
 		msg.Response = true
 		msg.RecursionAvailable = true
+
+		appName := s.getAppName(domain)
 
 		s.addLog(LogEntry{
 			Timestamp: time.Now().Format("15:04:05"),
 			Domain:    strings.TrimSuffix(domain, "."),
 			Type:      qtype,
 			Action:    "blocked",
+			Category:  string(category),
 			ClientIP:  clientIP,
-			Reason:    "blocklist",
+			Reason:    reason,
+			AppName:   appName,
 		})
 
-		return msg, true, "blocked"
+		return msg, true, "blocked", category
 	}
 
-	return nil, false, "forward"
+	return nil, false, "forward", ""
 }
 
 func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string) *dns.Msg {
@@ -388,7 +495,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, fromCache, action := s.processDNSQuery(msg, clientIP)
+	result, fromCache, action, category := s.processDNSQuery(msg, clientIP)
 	if fromCache {
 		packed, _ := result.Pack()
 		w.Header().Set("Content-Type", "application/dns-message")
@@ -399,6 +506,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	if action == "blocked" {
 		packed, _ := result.Pack()
 		w.Header().Set("Content-Type", "application/dns-message")
+		w.Header().Set("X-Block-Category", string(category))
 		w.Write(packed)
 		return
 	}
@@ -409,59 +517,6 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	packed, _ := response.Pack()
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Write(packed)
-}
-
-func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
-	domain := r.URL.Query().Get("name")
-	if domain == "" {
-		http.Error(w, "Missing name parameter", http.StatusBadRequest)
-		return
-	}
-
-	qtype := dns.TypeA
-	typeStr := r.URL.Query().Get("type")
-	if typeStr != "" {
-		switch strings.ToUpper(typeStr) {
-		case "AAAA":
-			qtype = dns.TypeAAAA
-		case "CNAME":
-			qtype = dns.TypeCNAME
-		case "MX":
-			qtype = dns.TypeMX
-		}
-	}
-
-	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(domain), qtype)
-
-	clientIP := r.Header.Get("X-Forwarded-For")
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-	}
-
-	result, _, action := s.processDNSQuery(msg, clientIP)
-
-	if action == "blocked" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"domain":  domain,
-			"type":    typeStr,
-			"blocked": true,
-		})
-		_ = result // Use result to avoid unused variable error
-		return
-	}
-
-	cacheKey := fmt.Sprintf("%s:%d", dns.Fqdn(domain), qtype)
-	response := s.forwardAndCache(msg, cacheKey, clientIP)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"domain":   domain,
-		"type":     typeStr,
-		"blocked":  false,
-		"response": response.Answer,
-	})
 }
 
 func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
@@ -477,25 +532,27 @@ func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	blocklistHTML := ""
-	for i, url := range s.config.Blocklists {
-		blocklistHTML += fmt.Sprintf("<li><code>%s</code></li>", url)
-		if i >= 4 {
-			remaining := len(s.config.Blocklists) - 5
-			if remaining > 0 {
-				blocklistHTML += fmt.Sprintf("<li>... and %d more</li>", remaining)
-			}
-			break
-		}
+	s.mu.RLock()
+	categories := make(map[string]int)
+	for cat, domains := range s.blocklists {
+		categories[string(cat)] = len(domains)
 	}
+	s.mu.RUnlock()
 
 	host := r.Host
+
+	// Build category HTML
+	catHTML := ""
+	for cat, count := range categories {
+		catHTML += fmt.Sprintf("<div class='cat-box %s'><strong>%s</strong><br>%d domains</div>", cat, strings.ToUpper(cat), count)
+	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
-    <title>Render DoH AdBlocker - Live Logs</title>
+    <title>Parental Control + AdBlock</title>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { box-sizing: border-box; }
         body { 
@@ -510,21 +567,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         h1 { color: #38bdf8; margin-bottom: 10px; }
         .subtitle { color: #94a3b8; margin-bottom: 30px; }
         
-        .grid { 
-            display: grid; 
-            grid-template-columns: 1fr 1fr; 
-            gap: 20px; 
-            margin-bottom: 20px;
-        }
-        @media (max-width: 900px) {
-            .grid { grid-template-columns: 1fr; }
-        }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+        @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
         
-        .stats { 
-            display: grid; 
-            grid-template-columns: repeat(2, 1fr); 
-            gap: 15px; 
-        }
+        .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
         .stat-box { 
             background: #1e293b; 
             padding: 20px; 
@@ -535,12 +581,20 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .blocked .stat-value { color: #ef4444; }
         .cached { border-left-color: #10b981; }
         .cached .stat-value { color: #10b981; }
-        .stat-value { 
-            font-size: 2em; 
-            font-weight: bold; 
-            color: #38bdf8; 
-            margin-top: 5px; 
+        .stat-value { font-size: 2em; font-weight: bold; color: #38bdf8; margin-top: 5px; }
+        
+        .categories { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 20px 0; }
+        .cat-box { 
+            background: #1e293b; 
+            padding: 15px; 
+            border-radius: 8px; 
+            text-align: center;
+            border: 2px solid #334155;
         }
+        .cat-box.ads { border-color: #ef4444; }
+        .cat-box.social { border-color: #8b5cf6; }
+        .cat-box.gaming { border-color: #f59e0b; }
+        .cat-box.streaming { border-color: #ec4899; }
         
         .logs-container { 
             background: #1e293b; 
@@ -556,9 +610,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             margin-bottom: 15px;
             padding-bottom: 15px;
             border-bottom: 1px solid #334155;
+            flex-wrap: wrap;
+            gap: 10px;
         }
         .logs-title { font-size: 1.2em; font-weight: bold; color: #38bdf8; }
-        .logs-controls { display: flex; gap: 10px; }
+        .logs-controls { display: flex; gap: 10px; flex-wrap: wrap; }
         .btn {
             background: #334155;
             color: #e2e8f0;
@@ -579,24 +635,25 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         }
         .log-entry {
             display: grid;
-            grid-template-columns: 70px 80px 200px 1fr 100px;
-            gap: 10px;
+            grid-template-columns: 60px 50px 180px 80px 90px 100px;
+            gap: 8px;
             padding: 6px 10px;
             border-bottom: 1px solid #334155;
             animation: fadeIn 0.3s ease;
+            align-items: center;
         }
         @keyframes fadeIn {
             from { opacity: 0; transform: translateX(-10px); }
             to { opacity: 1; transform: translateX(0); }
         }
         .log-entry:hover { background: #334155; }
-        .log-time { color: #94a3b8; }
-        .log-type { color: #38bdf8; font-weight: bold; }
+        .log-time { color: #94a3b8; font-size: 0.9em; }
+        .log-type { color: #38bdf8; font-weight: bold; font-size: 0.9em; }
         .log-domain { color: #e2e8f0; overflow: hidden; text-overflow: ellipsis; }
         .log-action { 
-            padding: 2px 8px; 
+            padding: 2px 6px; 
             border-radius: 4px; 
-            font-size: 0.85em;
+            font-size: 0.75em;
             font-weight: bold;
             text-align: center;
         }
@@ -604,28 +661,48 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .action-cached { background: #10b981; color: white; }
         .action-forwarded { background: #38bdf8; color: #0f172a; }
         .action-error { background: #f59e0b; color: #0f172a; }
-        .log-client { color: #64748b; font-size: 0.8em; }
+        .log-category {
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            font-weight: bold;
+            text-align: center;
+        }
+        .cat-ads { background: #ef4444; color: white; }
+        .cat-social { background: #8b5cf6; color: white; }
+        .cat-gaming { background: #f59e0b; color: #0f172a; }
+        .cat-streaming { background: #ec4899; color: white; }
+        .log-app { color: #64748b; font-size: 0.8em; overflow: hidden; text-overflow: ellipsis; }
         
         .config { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
-        .blocklists { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
         code { background: #334155; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; word-break: break-all; }
         .url { word-break: break-all; color: #38bdf8; font-weight: 600; }
-        button { background: #38bdf8; color: #0f172a; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 1em; }
-        button:hover { background: #7dd3fc; }
-        ul { line-height: 2; }
         .badge { display: inline-block; background: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; margin-left: 10px; }
         .status-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%%; margin-right: 5px; }
         .status-live { background: #10b981; animation: pulse 2s infinite; }
-        @keyframes pulse {
-            0%%, 100%% { opacity: 1; }
-            50%% { opacity: 0.5; }
+        @keyframes pulse { 0%%, 100%% { opacity: 1; } 50%% { opacity: 0.5; } }
+        
+        .toggle-container { display: flex; gap: 15px; flex-wrap: wrap; margin: 15px 0; }
+        .toggle {
+            background: #334155;
+            padding: 10px 15px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        .filter-group { display: flex; gap: 5px; }
+        .toggle.active { background: #38bdf8; color: #0f172a; }
+        .toggle input { margin: 0; }
     </style>
 </head>
 <body>
-    <h1>🛡️ Render DoH AdBlocker <span class="badge">LIVE</span></h1>
-    <p class="subtitle">Real-time DNS logging and ad blocking</p>
+    <h1>🛡️ Parental Control + AdBlock <span class="badge">ACTIVE</span></h1>
+    <p class="subtitle">Block ads, social media, games, and streaming</p>
+    
+    <div class="categories">
+        %s
+    </div>
     
     <div class="grid">
         <div>
@@ -643,15 +720,16 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                     <div class="stat-value" id="cached">0</div>
                 </div>
                 <div class="stat-box">
-                    <div>Blocklist Size</div>
-                    <div class="stat-value" id="blocklistSize">0</div>
+                    <div>Active Categories</div>
+                    <div class="stat-value" id="categories">%d</div>
                 </div>
             </div>
             
             <div class="config" style="margin-top: 20px;">
-                <h3>🔗 Connection Info</h3>
-                <p><strong>DoH Endpoint:</strong><br><span class="url">https://%s/dns-query</span></p>
-                <p><strong>Simple API:</strong><br><span class="url">https://%s/dns?name=example.com</span></p>
+                <h3>🔗 Setup</h3>
+                <p><strong>DoH URL:</strong><br><span class="url">https://%s/dns-query</span></p>
+                <p><strong>iOS/Android:</strong> Use AdGuard DNS app</p>
+                <p><strong>Windows/Mac:</strong> Use YogaDNS or system settings</p>
             </div>
         </div>
         
@@ -659,14 +737,14 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             <div class="logs-header">
                 <div class="logs-title">
                     <span class="status-indicator status-live"></span>
-                    Live Logs
+                    Live Activity
                 </div>
                 <div class="logs-controls">
-                    <div class="filter-group">
-                        <button class="btn active" onclick="filterLogs('all')" id="filter-all">All</button>
-                        <button class="btn" onclick="filterLogs('blocked')" id="filter-blocked">Blocked</button>
-                        <button class="btn" onclick="filterLogs('cached')" id="filter-cached">Cached</button>
-                    </div>
+                    <button class="btn active" onclick="filterLogs('all')" id="filter-all">All</button>
+                    <button class="btn" onclick="filterLogs('blocked')" id="filter-blocked">Blocked</button>
+                    <button class="btn" onclick="filterLogs('ads')" id="filter-ads">Ads</button>
+                    <button class="btn" onclick="filterLogs('social')" id="filter-social">Social</button>
+                    <button class="btn" onclick="filterLogs('gaming')" id="filter-gaming">Games</button>
                     <button class="btn" onclick="clearLogs()">Clear</button>
                     <button class="btn" onclick="pauseLogs()" id="pause-btn">Pause</button>
                 </div>
@@ -675,16 +753,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         </div>
     </div>
 
-    <div class="blocklists">
-        <h3>📋 Active Blocklists (%d)</h3>
-        <ul>%s</ul>
-    </div>
-
     <script>
         let eventSource;
         let isPaused = false;
         let currentFilter = 'all';
-        let logCount = 0;
         
         function connectSSE() {
             eventSource = new EventSource('/api/logs/stream');
@@ -705,40 +777,45 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         function addLogEntry(entry) {
             const logsDiv = document.getElementById('logs');
             
-            if (currentFilter !== 'all' && entry.action !== currentFilter) {
-                return;
-            }
+            // Filter logic
+            if (currentFilter === 'blocked' && entry.action !== 'blocked') return;
+            if (currentFilter === 'ads' && entry.category !== 'ads') return;
+            if (currentFilter === 'social' && entry.category !== 'social') return;
+            if (currentFilter === 'gaming' && entry.category !== 'gaming') return;
             
             const div = document.createElement('div');
             div.className = 'log-entry';
+            
+            const catClass = entry.category ? 'cat-' + entry.category : '';
+            const catText = entry.category ? entry.category.toUpperCase() : '';
+            
             div.innerHTML = '<span class="log-time">' + entry.timestamp + '</span>' +
                 '<span class="log-type">' + entry.type + '</span>' +
                 '<span class="log-domain" title="' + entry.domain + '">' + entry.domain + '</span>' +
                 '<span class="log-action action-' + entry.action + '">' + entry.action.toUpperCase() + '</span>' +
-                '<span class="log-client">' + entry.client_ip.split(':')[0] + '</span>';
+                '<span class="log-category ' + catClass + '">' + catText + '</span>' +
+                '<span class="log-app">' + (entry.app_name || '') + '</span>';
             
             logsDiv.insertBefore(div, logsDiv.firstChild);
             
             while (logsDiv.children.length > 100) {
                 logsDiv.removeChild(logsDiv.lastChild);
             }
-            
-            logCount++;
         }
         
         function filterLogs(type) {
             currentFilter = type;
-            document.querySelectorAll('.filter-group .btn').forEach(btn => {
-                btn.classList.remove('active');
+            document.querySelectorAll('.logs-controls .btn').forEach(btn => {
+                if (btn.id !== 'pause-btn' && !btn.textContent.includes('Clear')) {
+                    btn.classList.remove('active');
+                }
             });
             document.getElementById('filter-' + type).classList.add('active');
             document.getElementById('logs').innerHTML = '';
-            logCount = 0;
         }
         
         function clearLogs() {
             document.getElementById('logs').innerHTML = '';
-            logCount = 0;
         }
         
         function pauseLogs() {
@@ -753,7 +830,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 document.getElementById('total').textContent = data.total_queries.toLocaleString();
                 document.getElementById('blocked').textContent = data.blocked_queries.toLocaleString();
                 document.getElementById('cached').textContent = data.cached_queries.toLocaleString();
-                document.getElementById('blocklistSize').textContent = data.blocklist_size.toLocaleString();
             } catch (e) {
                 console.error('Stats error:', e);
             }
@@ -765,7 +841,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 const logs = await res.json();
                 logs.reverse().forEach(entry => addLogEntry(entry));
             } catch (e) {
-                console.error('Failed to load recent logs:', e);
+                console.error('Failed to load logs:', e);
             }
         }
         
@@ -775,7 +851,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         setInterval(updateStats, 5000);
     </script>
 </body>
-</html>`, host, host, len(s.config.Blocklists), blocklistHTML)
+</html>`, catHTML, len(categories), host)
 
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(html))
@@ -788,7 +864,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"blocked_queries": s.stats.BlockedQueries,
 		"cached_queries":  s.stats.CachedQueries,
 		"uptime":          time.Since(s.startTime).Round(time.Second).String(),
-		"blocklist_size":  len(s.blocklist),
+		"by_category":     s.stats.ByCategory,
 	}
 	s.mu.RUnlock()
 
@@ -860,59 +936,44 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("Manual blocklist reload requested")
-	if err := s.loadBlocklists(); err != nil {
+	log.Println("Reloading blocklists...")
+	if err := s.loadAllBlocklists(); err != nil {
 		http.Error(w, fmt.Sprintf("Reload failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	s.mu.RLock()
+	totalDomains := 0
+	for _, domains := range s.blocklists {
+		totalDomains += len(domains)
+	}
+	s.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "reloaded",
-		"domains": fmt.Sprintf("%d", len(s.blocklist)),
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "reloaded",
+		"total_domains": totalDomains,
+		"categories":    len(s.blocklists),
 	})
 }
 
-func (s *Server) startRefreshLoop() {
-	ticker := time.NewTicker(24 * time.Hour)
-	go func() {
-		for range ticker.C {
-			log.Println("Auto-refreshing blocklists...")
-			s.loadBlocklists()
-		}
-	}()
-}
-
-func parseBlocklistURLs() []string {
-	urlsEnv := os.Getenv("BLOCKLIST_URLS")
-	if urlsEnv == "" {
-		return defaultBlocklists
-	}
-
-	urls := strings.Split(urlsEnv, ",")
-	var result []string
-	for _, url := range urls {
-		url = strings.TrimSpace(url)
-		if url != "" {
-			result = append(result, url)
-		}
-	}
-
-	if len(result) == 0 {
-		return defaultBlocklists
-	}
-
-	log.Printf("Using %d custom blocklists from environment", len(result))
-	return result
-}
-
 func loadConfig() Config {
+	// Parse block config from env
+	blockConfig := BlockConfig{
+		Ads:       getEnvBool("BLOCK_ADS", true),
+		Social:    getEnvBool("BLOCK_SOCIAL", true),
+		Gaming:    getEnvBool("BLOCK_GAMING", true),
+		Streaming: getEnvBool("BLOCK_STREAMING", false),
+		Custom:    getEnvBool("BLOCK_CUSTOM", false),
+	}
+
 	return Config{
 		Port:        getEnv("PORT", "10000"),
 		UpstreamDNS: []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"},
 		Blocklists:  parseBlocklistURLs(),
 		Whitelist:   []string{},
 		CacheSize:   5000,
+		BlockConfig: blockConfig,
 	}
 }
 
@@ -923,16 +984,33 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+func getEnvBool(key string, fallback bool) bool {
+	if value, ok := os.LookupEnv(key); ok {
+		return value == "true" || value == "1" || value == "yes"
+	}
+	return fallback
+}
+
 func main() {
 	config := loadConfig()
 	server := NewServer(config)
 
-	log.Printf("Starting with %d blocklists:", len(config.Blocklists))
-	for _, url := range config.Blocklists {
-		log.Printf("  - %s", url)
+	log.Printf("Starting Parental Control + AdBlock")
+	log.Printf("Categories enabled:")
+	if config.BlockConfig.Ads {
+		log.Printf("  ✓ Ads")
+	}
+	if config.BlockConfig.Social {
+		log.Printf("  ✓ Social Media")
+	}
+	if config.BlockConfig.Gaming {
+		log.Printf("  ✓ Gaming")
+	}
+	if config.BlockConfig.Streaming {
+		log.Printf("  ✓ Streaming")
 	}
 
-	if err := server.loadBlocklists(); err != nil {
+	if err := server.loadAllBlocklists(); err != nil {
 		log.Printf("Warning: %v", err)
 	}
 	server.startRefreshLoop()
@@ -943,7 +1021,6 @@ func main() {
 	http.HandleFunc("/api/logs/stream", server.handleLogsStream)
 	http.HandleFunc("/api/reload", server.handleReload)
 	http.HandleFunc("/dns-query", server.handleDoH)
-	http.HandleFunc("/dns", server.handleSimpleDNS)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
@@ -951,7 +1028,6 @@ func main() {
 
 	port := config.Port
 	log.Printf("Server starting on port %s", port)
-	log.Printf("Dashboard: http://localhost:%s", port)
 
 	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
