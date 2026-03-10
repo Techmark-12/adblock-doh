@@ -52,17 +52,16 @@ type BlockConfig struct {
 }
 
 type Config struct {
-	Port        string      `json:"port"`
-	UpstreamDNS []string    `json:"upstream_dns"`
-	Blocklists  []string    `json:"blocklists"`
-	Whitelist   []string    `json:"whitelist"`
-	CacheSize   int         `json:"cache_size"`
-	BlockConfig BlockConfig `json:"block_config"`
-	// Environment-based domain lists (comma-separated)
-	SocialDomains    []string `json:"-"`
-	GamingDomains    []string `json:"-"`
-	StreamingDomains []string `json:"-"`
-	CustomDomains    []string `json:"-"`
+	Port             string      `json:"port"`
+	UpstreamDNS      []string    `json:"upstream_dns"`
+	Blocklists       []string    `json:"blocklists"`
+	Whitelist        []string    `json:"whitelist"`
+	CacheSize        int         `json:"cache_size"`
+	BlockConfig      BlockConfig `json:"block_config"`
+	SocialDomains    []string    `json:"-"`
+	GamingDomains    []string    `json:"-"`
+	StreamingDomains []string    `json:"-"`
+	CustomDomains    []string    `json:"-"`
 }
 
 type Server struct {
@@ -175,9 +174,7 @@ func (s *Server) loadAllBlocklists() error {
 
 	// Load ads blocklists (from URLs)
 	if s.config.BlockConfig.Ads {
-		if err := s.loadCategoryFromURLs(CategoryAds, s.config.Blocklists); err != nil {
-			log.Printf("Failed to load ads blocklists: %v", err)
-		}
+		s.loadCategoryFromURLs(CategoryAds, s.config.Blocklists)
 	}
 
 	// Load social media (from URLs + env domains)
@@ -188,7 +185,7 @@ func (s *Server) loadAllBlocklists() error {
 		s.loadCategoryFromDomains(CategorySocial, s.config.SocialDomains)
 	}
 
-	// Load gaming (from env domains only - no external URLs)
+	// Load gaming (from env domains only)
 	if s.config.BlockConfig.Gaming {
 		s.loadCategoryFromDomains(CategoryGaming, s.config.GamingDomains)
 	}
