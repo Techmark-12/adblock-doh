@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -20,6 +21,16 @@ var defaultBlocklists = []string{
 	"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 	"https://adaway.org/hosts.txt",
 	"https://v.firebog.net/hosts/Easylist.txt",
+}
+
+// LogEntry represents a single DNS query log
+type LogEntry struct {
+	Timestamp string `json:"timestamp"`
+	Domain    string `json:"domain"`
+	Type      string `json:"type"`
+	Action    string `json:"action"` // "blocked", "cached", "forwarded", "error"
+	ClientIP  string `json:"client_ip"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 type Config struct {
@@ -39,6 +50,15 @@ type Server struct {
 	mu        sync.RWMutex
 	stats     Stats
 	startTime time.Time
+	
+	// Live log storage (circular buffer)
+	logs     []LogEntry
+	logsMu   sync.RWMutex
+	maxLogs  int
+	
+	// SSE clients
+	clients     map[chan LogEntry]bool
+	clientsMu   sync.RWMutex
 }
 
 type Stats struct {
@@ -49,7 +69,7 @@ type Stats struct {
 
 type Cache struct {
 	mu    sync.RWMutex
-	items map[string]cacheEntry
+	items map[string]cacheItem
 	size  int
 }
 
@@ -94,7 +114,7 @@ func NewServer(config Config) *Server {
 	for _, w := range config.Whitelist {
 		whitelist[strings.ToLower(w)] = true
 	}
-
+	
 	return &Server{
 		config:    config,
 		blocklist: make(map[string]bool),
@@ -102,13 +122,40 @@ func NewServer(config Config) *Server {
 		cache:     NewCache(config.CacheSize),
 		upstream:  config.UpstreamDNS,
 		startTime: time.Now(),
+		logs:      make([]LogEntry, 0),
+		maxLogs:   1000, // Keep last 1000 entries
+		clients:   make(map[chan LogEntry]bool),
 	}
+}
+
+func (s *Server) addLog(entry LogEntry) {
+	s.logsMu.Lock()
+	
+	// Add to circular buffer
+	s.logs = append(s.logs, entry)
+	if len(s.logs) > s.maxLogs {
+		s.logs = s.logs[1:] // Remove oldest
+	}
+	
+	s.logsMu.Unlock()
+	
+	// Broadcast to SSE clients
+	s.clientsMu.RLock()
+	for client := range s.clients {
+		select {
+		case client <- entry:
+			// Sent successfully
+		default:
+			// Channel full, skip
+		}
+	}
+	s.clientsMu.RUnlock()
 }
 
 func (s *Server) loadBlocklists() error {
 	log.Println("Fetching blocklists...")
 	newBlocklist := make(map[string]bool)
-
+	
 	for _, url := range s.config.Blocklists {
 		log.Printf("Loading: %s", url)
 		if err := s.fetchBlocklist(url, newBlocklist); err != nil {
@@ -116,11 +163,11 @@ func (s *Server) loadBlocklists() error {
 			continue
 		}
 	}
-
+	
 	s.mu.Lock()
 	s.blocklist = newBlocklist
 	s.mu.Unlock()
-
+	
 	log.Printf("Loaded %d blocked domains", len(newBlocklist))
 	return nil
 }
@@ -132,27 +179,27 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 		return err
 	}
 	defer resp.Body.Close()
-
+	
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
+	
 	scanner := bufio.NewScanner(resp.Body)
 	lineCount := 0
-
+	
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		lineCount++
-
+		
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
 			continue
 		}
-
+		
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
 			ip := fields[0]
 			domain := strings.ToLower(fields[1])
-
+			
 			if ip == "0.0.0.0" || ip == "127.0.0.1" || ip == "::1" {
 				if domain != "localhost" && !strings.Contains(domain, "localhost") {
 					blocklist[domain] = true
@@ -166,13 +213,13 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 			domain = strings.TrimSuffix(domain, ".")
 			blocklist[domain] = true
 		}
-
+		
 		if strings.HasPrefix(line, "||") && strings.HasSuffix(line, "^") {
 			domain := strings.ToLower(line[2 : len(line)-1])
 			domain = strings.TrimPrefix(domain, "www.")
 			blocklist[domain] = true
 		}
-
+		
 		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
 			urlParts := strings.SplitN(line, "/", 3)
 			if len(urlParts) >= 2 {
@@ -181,11 +228,11 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 			}
 		}
 	}
-
+	
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-
+	
 	log.Printf("Processed %d lines from %s", lineCount, url)
 	return nil
 }
@@ -193,16 +240,16 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 func (s *Server) isBlocked(domain string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
+	
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
-
+	
 	if s.whitelist[domain] {
 		return false
 	}
 	if s.blocklist[domain] {
 		return true
 	}
-
+	
 	parts := strings.Split(domain, ".")
 	for i := 1; i < len(parts)-1; i++ {
 		parent := strings.Join(parts[i:], ".")
@@ -213,48 +260,91 @@ func (s *Server) isBlocked(domain string) bool {
 	return false
 }
 
-func (s *Server) processDNSQuery(msg *dns.Msg) (*dns.Msg, bool) {
+func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool, string) {
 	if len(msg.Question) == 0 {
-		return msg, false
+		return msg, false, "no question"
 	}
-
+	
 	question := msg.Question[0]
 	domain := question.Name
-	qtype := question.Qtype
-
+	qtype := dns.TypeToString[question.Qtype]
+	if qtype == "" {
+		qtype = fmt.Sprintf("TYPE%d", question.Qtype)
+	}
+	
 	s.stats.TotalQueries++
-
-	cacheKey := fmt.Sprintf("%s:%d", domain, qtype)
+	
+	cacheKey := fmt.Sprintf("%s:%d", domain, question.Qtype)
 	if cached, found := s.cache.Get(cacheKey); found {
 		s.stats.CachedQueries++
 		cachedMsg := new(dns.Msg)
 		cachedMsg.Unpack(cached)
 		cachedMsg.Id = msg.Id
-		return cachedMsg, true
+		
+		// Log cache hit
+		s.addLog(LogEntry{
+			Timestamp: time.Now().Format("15:04:05"),
+			Domain:    strings.TrimSuffix(domain, "."),
+			Type:      qtype,
+			Action:    "cached",
+			ClientIP:  clientIP,
+		})
+		
+		return cachedMsg, true, "cache hit"
 	}
-
+	
 	if s.isBlocked(domain) {
 		s.stats.BlockedQueries++
 		msg.Rcode = dns.RcodeNameError
 		msg.Response = true
 		msg.RecursionAvailable = true
-		log.Printf("[BLOCKED] %s", domain)
-		return msg, true
+		
+		// Log block
+		s.addLog(LogEntry{
+			Timestamp: time.Now().Format("15:04:05"),
+			Domain:    strings.TrimSuffix(domain, "."),
+			Type:      qtype,
+			Action:    "blocked",
+			ClientIP:  clientIP,
+			Reason:    "blocklist",
+		})
+		
+		return msg, true, "blocked"
 	}
-
-	return nil, false
+	
+	return nil, false, "forward"
 }
 
-func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string) *dns.Msg {
+func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string) *dns.Msg {
 	response, err := s.forwardQuery(msg)
+	
+	qtype := "A"
+	if len(msg.Question) > 0 {
+		qtype = dns.TypeToString[msg.Question[0].Qtype]
+	}
+	domain := ""
+	if len(msg.Question) > 0 {
+		domain = strings.TrimSuffix(msg.Question[0].Name, ".")
+	}
+	
 	if err != nil {
 		log.Printf("Forward error: %v", err)
 		msg.Rcode = dns.RcodeServerFailure
 		msg.Response = true
 		msg.RecursionAvailable = true
+		
+		s.addLog(LogEntry{
+			Timestamp: time.Now().Format("15:04:05"),
+			Domain:    domain,
+			Type:      qtype,
+			Action:    "error",
+			ClientIP:  clientIP,
+			Reason:    err.Error(),
+		})
+		
 		return msg
 	}
-
+	
 	packed, _ := response.Pack()
 	ttl := 300 * time.Second
 	if len(response.Answer) > 0 {
@@ -263,15 +353,28 @@ func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string) *dns.Msg {
 		}
 	}
 	s.cache.Set(cacheKey, packed, ttl)
-
+	
+	// Log forward
+	s.addLog(LogEntry{
+		Timestamp: time.Now().Format("15:04:05"),
+		Domain:    domain,
+		Type:      qtype,
+		Action:    "forwarded",
+		ClientIP:  clientIP,
+	})
+	
 	return response
 }
 
-// HTTP handler for DoH (RFC 8484)
 func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	
 	var body []byte
 	var err error
-
+	
 	if r.Method == http.MethodGet {
 		dnsParam := r.URL.Query().Get("dns")
 		if dnsParam == "" {
@@ -293,44 +396,43 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
+	
 	msg := new(dns.Msg)
 	if err := msg.Unpack(body); err != nil {
 		http.Error(w, "Invalid DNS message", http.StatusBadRequest)
 		return
 	}
-
-	result, fromCache := s.processDNSQuery(msg)
+	
+	result, fromCache, action := s.processDNSQuery(msg, clientIP)
 	if fromCache {
 		packed, _ := result.Pack()
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Write(packed)
 		return
 	}
-
-	if result != nil && result.Rcode == dns.RcodeNameError {
+	
+	if action == "blocked" {
 		packed, _ := result.Pack()
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Write(packed)
 		return
 	}
-
+	
 	cacheKey := fmt.Sprintf("%s:%d", msg.Question[0].Name, msg.Question[0].Qtype)
-	response := s.forwardAndCache(msg, cacheKey)
-
+	response := s.forwardAndCache(msg, cacheKey, clientIP)
+	
 	packed, _ := response.Pack()
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Write(packed)
 }
 
-// HTTP handler for simple DNS proxy (for Cloudflare Worker bridge)
 func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 	domain := r.URL.Query().Get("name")
 	if domain == "" {
 		http.Error(w, "Missing name parameter", http.StatusBadRequest)
 		return
 	}
-
+	
 	qtype := dns.TypeA
 	typeStr := r.URL.Query().Get("type")
 	if typeStr != "" {
@@ -343,26 +445,33 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 			qtype = dns.TypeMX
 		}
 	}
-
+	
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(domain), qtype)
-
-	result, _ := s.processDNSQuery(msg)
-	if result != nil && result.Rcode == dns.RcodeNameError {
+	
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	
+	result, _, action := s.processDNSQuery(msg, clientIP)
+	if action == "blocked" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"blocked": true,
 			"domain":  domain,
+			"type":    typeStr,
+			"blocked": true,
 		})
 		return
 	}
-
+	
 	cacheKey := fmt.Sprintf("%s:%d", dns.Fqdn(domain), qtype)
-	response := s.forwardAndCache(msg, cacheKey)
-
+	response := s.forwardAndCache(msg, cacheKey, clientIP)
+	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"domain":   domain,
+		"type":     typeStr,
 		"blocked":  false,
 		"response": response.Answer,
 	})
@@ -370,7 +479,7 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
 	c := &dns.Client{Timeout: 5 * time.Second}
-
+	
 	for _, server := range s.upstream {
 		m, _, err := c.Exchange(r, server)
 		if err == nil {
@@ -389,86 +498,271 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-
+	
 	html := `<!DOCTYPE html>
 <html>
 <head>
-    <title>Render DoH AdBlocker</title>
+    <title>Render DoH AdBlocker - Live Logs</title>
     <meta charset="utf-8">
     <style>
-        body { font-family: system-ui, -apple-system, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #0f172a; color: #e2e8f0; line-height: 1.6; }
+        * { box-sizing: border-box; }
+        body { 
+            font-family: system-ui, -apple-system, sans-serif; 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            padding: 20px; 
+            background: #0f172a; 
+            color: #e2e8f0; 
+            line-height: 1.6; 
+        }
         h1 { color: #38bdf8; margin-bottom: 10px; }
         .subtitle { color: #94a3b8; margin-bottom: 30px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
-        .stat-box { background: #1e293b; padding: 20px; border-radius: 8px; border-left: 4px solid #38bdf8; }
-        .stat-value { font-size: 2em; font-weight: bold; color: #38bdf8; margin-top: 5px; }
+        
+        .grid { 
+            display: grid; 
+            grid-template-columns: 1fr 1fr; 
+            gap: 20px; 
+            margin-bottom: 20px;
+        }
+        @media (max-width: 900px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+        
+        .stats { 
+            display: grid; 
+            grid-template-columns: repeat(2, 1fr); 
+            gap: 15px; 
+        }
+        .stat-box { 
+            background: #1e293b; 
+            padding: 20px; 
+            border-radius: 8px; 
+            border-left: 4px solid #38bdf8; 
+        }
         .blocked { border-left-color: #ef4444; }
         .blocked .stat-value { color: #ef4444; }
+        .cached { border-left-color: #10b981; }
+        .cached .stat-value { color: #10b981; }
+        .stat-value { 
+            font-size: 2em; 
+            font-weight: bold; 
+            color: #38bdf8; 
+            margin-top: 5px; 
+        }
+        
+        .logs-container { 
+            background: #1e293b; 
+            border-radius: 8px; 
+            padding: 20px;
+            max-height: 500px;
+            overflow: hidden;
+        }
+        .logs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #334155;
+        }
+        .logs-title { font-size: 1.2em; font-weight: bold; color: #38bdf8; }
+        .logs-controls { display: flex; gap: 10px; }
+        .btn {
+            background: #334155;
+            color: #e2e8f0;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .btn:hover { background: #475569; }
+        .btn.active { background: #38bdf8; color: #0f172a; }
+        
+        #logs {
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+        }
+        .log-entry {
+            display: grid;
+            grid-template-columns: 70px 80px 200px 1fr 100px;
+            gap: 10px;
+            padding: 6px 10px;
+            border-bottom: 1px solid #334155;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        .log-entry:hover { background: #334155; }
+        .log-time { color: #94a3b8; }
+        .log-type { color: #38bdf8; font-weight: bold; }
+        .log-domain { color: #e2e8f0; overflow: hidden; text-overflow: ellipsis; }
+        .log-action { 
+            padding: 2px 8px; 
+            border-radius: 4px; 
+            font-size: 0.85em;
+            font-weight: bold;
+            text-align: center;
+        }
+        .action-blocked { background: #ef4444; color: white; }
+        .action-cached { background: #10b981; color: white; }
+        .action-forwarded { background: #38bdf8; color: #0f172a; }
+        .action-error { background: #f59e0b; color: #0f172a; }
+        .log-client { color: #64748b; font-size: 0.8em; }
+        
         .config { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
         .blocklists { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
-        code { background: #334155; padding: 2px 6px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 0.9em; word-break: break-all; }
+        code { background: #334155; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; word-break: break-all; }
         .url { word-break: break-all; color: #38bdf8; font-weight: 600; }
-        button { background: #38bdf8; color: #0f172a; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 1em; margin-top: 10px; }
-        button:hover { background: #7dd3fc; transform: translateY(-1px); }
+        button { background: #38bdf8; color: #0f172a; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 1em; }
+        button:hover { background: #7dd3fc; }
         ul { line-height: 2; }
-        li { margin-bottom: 8px; }
         .badge { display: inline-block; background: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; margin-left: 10px; }
-        .info-box { background: #334155; padding: 15px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #f59e0b; }
-        .bridge-info { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; border: 2px solid #38bdf8; }
+        .status-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+        .status-live { background: #10b981; animation: pulse 2s infinite; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .filter-group { display: flex; gap: 5px; }
     </style>
 </head>
 <body>
     <h1>🛡️ Render DoH AdBlocker <span class="badge">LIVE</span></h1>
-    <p class="subtitle">DNS-over-HTTPS ad blocker with router support</p>
+    <p class="subtitle">Real-time DNS logging and ad blocking</p>
     
-    <div class="stats">
-        <div class="stat-box">
-            <div>Total Queries</div>
-            <div class="stat-value" id="total">0</div>
+    <div class="grid">
+        <div>
+            <div class="stats">
+                <div class="stat-box">
+                    <div>Total Queries</div>
+                    <div class="stat-value" id="total">0</div>
+                </div>
+                <div class="stat-box blocked">
+                    <div>Blocked</div>
+                    <div class="stat-value" id="blocked">0</div>
+                </div>
+                <div class="stat-box cached">
+                    <div>Cached</div>
+                    <div class="stat-value" id="cached">0</div>
+                </div>
+                <div class="stat-box">
+                    <div>Blocklist Size</div>
+                    <div class="stat-value" id="blocklistSize">0</div>
+                </div>
+            </div>
+            
+            <div class="config" style="margin-top: 20px;">
+                <h3>🔗 Connection Info</h3>
+                <p><strong>DoH Endpoint:</strong><br><span class="url">https://`+r.Host+`/dns-query</span></p>
+                <p><strong>Simple API:</strong><br><span class="url">https://`+r.Host+`/dns?name=example.com</span></p>
+            </div>
         </div>
-        <div class="stat-box blocked">
-            <div>Blocked</div>
-            <div class="stat-value" id="blocked">0</div>
+        
+        <div class="logs-container">
+            <div class="logs-header">
+                <div class="logs-title">
+                    <span class="status-indicator status-live"></span>
+                    Live Logs
+                </div>
+                <div class="logs-controls">
+                    <div class="filter-group">
+                        <button class="btn active" onclick="filterLogs('all')" id="filter-all">All</button>
+                        <button class="btn" onclick="filterLogs('blocked')" id="filter-blocked">Blocked</button>
+                        <button class="btn" onclick="filterLogs('cached')" id="filter-cached">Cached</button>
+                    </div>
+                    <button class="btn" onclick="clearLogs()">Clear</button>
+                    <button class="btn" onclick="pauseLogs()" id="pause-btn">Pause</button>
+                </div>
+            </div>
+            <div id="logs"></div>
         </div>
-        <div class="stat-box">
-            <div>Cached</div>
-            <div class="stat-value" id="cached">0</div>
-        </div>
-        <div class="stat-box">
-            <div>Blocklist Size</div>
-            <div class="stat-value" id="blocklistSize">0</div>
-        </div>
-    </div>
-
-    <div class="bridge-info">
-        <h3>🔗 Router Setup (No Pi Needed!)</h3>
-        <p><strong>Step 1:</strong> Deploy Cloudflare Worker bridge</p>
-        <p><strong>Step 2:</strong> Set router DNS to Cloudflare Worker URL</p>
-        <p><strong>Bridge URL:</strong> <span class="url">https://dns-bridge.YOUR_SUBDOMAIN.workers.dev</span></p>
-        <p><strong>Direct DoH:</strong> <span class="url">https://` + r.Host + `/dns-query</span></p>
-    </div>
-
-    <div class="config">
-        <h3>📱 Device Setup</h3>
-        <ul>
-            <li><strong>Android/iOS:</strong> Use direct DoH URL above</li>
-            <li><strong>Firefox/Chrome:</strong> Use direct DoH URL in settings</li>
-            <li><strong>Router:</strong> Use Cloudflare Worker bridge URL</li>
-        </ul>
     </div>
 
     <div class="blocklists">
-        <h3>📋 Active Blocklists (` + fmt.Sprintf("%d", len(s.config.Blocklists)) + `)</h3>
-        <ul>` + blocklistHTML + `</ul>
-        <div class="info-box">
-            <strong>💡 Tip:</strong> Set BLOCKLIST_URLS env var in Render dashboard for custom lists
-        </div>
+        <h3>📋 Active Blocklists (`+fmt.Sprintf("%d", len(s.config.Blocklists))+`)</h3>
+        <ul>`+blocklistHTML+`</ul>
     </div>
 
-    <button onclick="refresh()">🔄 Refresh Stats</button>
-
     <script>
-        async function refresh() {
+        let eventSource;
+        let isPaused = false;
+        let currentFilter = 'all';
+        let logCount = 0;
+        
+        function connectSSE() {
+            eventSource = new EventSource('/api/logs/stream');
+            
+            eventSource.onmessage = (event) => {
+                if (isPaused) return;
+                
+                const entry = JSON.parse(event.data);
+                addLogEntry(entry);
+            };
+            
+            eventSource.onerror = (err) => {
+                console.log('SSE error, reconnecting...');
+                setTimeout(connectSSE, 3000);
+            };
+        }
+        
+        function addLogEntry(entry) {
+            const logsDiv = document.getElementById('logs');
+            
+            // Apply filter
+            if (currentFilter !== 'all' && entry.action !== currentFilter) {
+                return;
+            }
+            
+            const div = document.createElement('div');
+            div.className = 'log-entry';
+            div.innerHTML = `
+                <span class="log-time">${entry.timestamp}</span>
+                <span class="log-type">${entry.type}</span>
+                <span class="log-domain" title="${entry.domain}">${entry.domain}</span>
+                <span class="log-action action-${entry.action}">${entry.action.toUpperCase()}</span>
+                <span class="log-client">${entry.client_ip.split(':')[0]}</span>
+            `;
+            
+            logsDiv.insertBefore(div, logsDiv.firstChild);
+            
+            // Keep only last 100 visible entries
+            while (logsDiv.children.length > 100) {
+                logsDiv.removeChild(logsDiv.lastChild);
+            }
+            
+            logCount++;
+        }
+        
+        function filterLogs(type) {
+            currentFilter = type;
+            
+            // Update buttons
+            document.querySelectorAll('.filter-group .btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.getElementById('filter-' + type).classList.add('active');
+            
+            // Clear and reload (simplified - just clear for now)
+            document.getElementById('logs').innerHTML = '';
+            logCount = 0;
+        }
+        
+        function clearLogs() {
+            document.getElementById('logs').innerHTML = '';
+            logCount = 0;
+        }
+        
+        function pauseLogs() {
+            isPaused = !isPaused;
+            document.getElementById('pause-btn').textContent = isPaused ? 'Resume' : 'Pause';
+        }
+        
+        async function updateStats() {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
@@ -477,11 +771,26 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 document.getElementById('cached').textContent = data.cached_queries.toLocaleString();
                 document.getElementById('blocklistSize').textContent = data.blocklist_size.toLocaleString();
             } catch (e) {
-                console.error('Failed to fetch stats:', e);
+                console.error('Stats error:', e);
             }
         }
-        refresh();
-        setInterval(refresh, 5000);
+        
+        // Load recent logs on startup
+        async function loadRecentLogs() {
+            try {
+                const res = await fetch('/api/logs');
+                const logs = await res.json();
+                logs.reverse().forEach(entry => addLogEntry(entry));
+            } catch (e) {
+                console.error('Failed to load recent logs:', e);
+            }
+        }
+        
+        // Start
+        loadRecentLogs();
+        connectSSE();
+        updateStats();
+        setInterval(updateStats, 5000);
     </script>
 </body>
 </html>`
@@ -499,9 +808,71 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"blocklist_size":  len(s.blocklist),
 	}
 	s.mu.RUnlock()
-
+	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	s.logsMu.RLock()
+	logs := make([]LogEntry, len(s.logs))
+	copy(logs, s.logs)
+	s.logsMu.RUnlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
+}
+
+func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	
+	// Create client channel
+	client := make(chan LogEntry, 100)
+	
+	s.clientsMu.Lock()
+	s.clients[client] = true
+	s.clientsMu.Unlock()
+	
+	defer func() {
+		s.clientsMu.Lock()
+		delete(s.clients, client)
+		s.clientsMu.Unlock()
+		close(client)
+	}()
+	
+	// Flush headers
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	flusher.Flush()
+	
+	// Send keepalive and wait for logs
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case entry, ok := <-client:
+			if !ok {
+				return
+			}
+			data, _ := json.Marshal(entry)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			
+		case <-ticker.C:
+			// Send keepalive comment
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+			
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
@@ -509,15 +880,18 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
+	
 	log.Println("Manual blocklist reload requested")
 	if err := s.loadBlocklists(); err != nil {
 		http.Error(w, fmt.Sprintf("Reload failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-
+	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "reloaded", "domains": fmt.Sprintf("%d", len(s.blocklist))})
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "reloaded", 
+		"domains": fmt.Sprintf("%d", len(s.blocklist)),
+	})
 }
 
 func (s *Server) startRefreshLoop() {
@@ -535,7 +909,7 @@ func parseBlocklistURLs() []string {
 	if urlsEnv == "" {
 		return defaultBlocklists
 	}
-
+	
 	urls := strings.Split(urlsEnv, ",")
 	var result []string
 	for _, url := range urls {
@@ -544,11 +918,11 @@ func parseBlocklistURLs() []string {
 			result = append(result, url)
 		}
 	}
-
+	
 	if len(result) == 0 {
 		return defaultBlocklists
 	}
-
+	
 	log.Printf("Using %d custom blocklists from environment", len(result))
 	return result
 }
@@ -573,30 +947,34 @@ func getEnv(key, fallback string) string {
 func main() {
 	config := loadConfig()
 	server := NewServer(config)
-
+	
 	log.Printf("Starting with %d blocklists:", len(config.Blocklists))
 	for _, url := range config.Blocklists {
 		log.Printf("  - %s", url)
 	}
-
+	
 	if err := server.loadBlocklists(); err != nil {
 		log.Printf("Warning: %v", err)
 	}
 	server.startRefreshLoop()
-
+	
+	// Routes
 	http.HandleFunc("/", server.handleDashboard)
 	http.HandleFunc("/api/stats", server.handleStats)
+	http.HandleFunc("/api/logs", server.handleLogs)
+	http.HandleFunc("/api/logs/stream", server.handleLogsStream)
 	http.HandleFunc("/api/reload", server.handleReload)
 	http.HandleFunc("/dns-query", server.handleDoH)
-	http.HandleFunc("/dns", server.handleSimpleDNS) // Simple DNS for bridge
+	http.HandleFunc("/dns", server.handleSimpleDNS)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
-
+	
 	port := config.Port
 	log.Printf("Server starting on port %s", port)
-
+	log.Printf("Dashboard: http://localhost:%s", port)
+	
 	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
