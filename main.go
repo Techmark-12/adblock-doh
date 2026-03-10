@@ -32,20 +32,6 @@ var defaultBlocklists = []string{
 	"https://adaway.org/hosts.txt",
 }
 
-// App blocker lists by category
-var appBlocklists = map[Category][]string{
-	CategorySocial: {
-		"https://raw.githubusercontent.com/jerryn70/Social-media-Blocklist/master/Social-media-Blocklist.txt",
-		"https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social-only/hosts",
-	},
-	CategoryGaming: {
-		"https://raw.githubusercontent.com/jerryn70/Gaming-Blocklist/master/Gaming-Blocklist.txt",
-	},
-	CategoryStreaming: {
-		"https://raw.githubusercontent.com/jerryn70/Streaming-Blocklist/master/Streaming-Blocklist.txt",
-	},
-}
-
 type LogEntry struct {
 	Timestamp string `json:"timestamp"`
 	Domain    string `json:"domain"`
@@ -72,6 +58,11 @@ type Config struct {
 	Whitelist   []string    `json:"whitelist"`
 	CacheSize   int         `json:"cache_size"`
 	BlockConfig BlockConfig `json:"block_config"`
+	// Environment-based domain lists (comma-separated)
+	SocialDomains    []string `json:"-"`
+	GamingDomains    []string `json:"-"`
+	StreamingDomains []string `json:"-"`
+	CustomDomains    []string `json:"-"`
 }
 
 type Server struct {
@@ -182,32 +173,34 @@ func (s *Server) addLog(entry LogEntry) {
 func (s *Server) loadAllBlocklists() error {
 	log.Println("Loading all blocklists...")
 
-	// Load ads blocklists
+	// Load ads blocklists (from URLs)
 	if s.config.BlockConfig.Ads {
-		if err := s.loadCategory(CategoryAds, s.config.Blocklists); err != nil {
+		if err := s.loadCategoryFromURLs(CategoryAds, s.config.Blocklists); err != nil {
 			log.Printf("Failed to load ads blocklists: %v", err)
 		}
 	}
 
-	// Load social media
+	// Load social media (from URLs + env domains)
 	if s.config.BlockConfig.Social {
-		if err := s.loadCategory(CategorySocial, appBlocklists[CategorySocial]); err != nil {
-			log.Printf("Failed to load social blocklists: %v", err)
-		}
+		s.loadCategoryFromURLs(CategorySocial, []string{
+			"https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social-only/hosts",
+		})
+		s.loadCategoryFromDomains(CategorySocial, s.config.SocialDomains)
 	}
 
-	// Load gaming
+	// Load gaming (from env domains only - no external URLs)
 	if s.config.BlockConfig.Gaming {
-		if err := s.loadCategory(CategoryGaming, appBlocklists[CategoryGaming]); err != nil {
-			log.Printf("Failed to load gaming blocklists: %v", err)
-		}
+		s.loadCategoryFromDomains(CategoryGaming, s.config.GamingDomains)
 	}
 
-	// Load streaming
+	// Load streaming (from env domains)
 	if s.config.BlockConfig.Streaming {
-		if err := s.loadCategory(CategoryStreaming, appBlocklists[CategoryStreaming]); err != nil {
-			log.Printf("Failed to load streaming blocklists: %v", err)
-		}
+		s.loadCategoryFromDomains(CategoryStreaming, s.config.StreamingDomains)
+	}
+
+	// Load custom (from env domains)
+	if s.config.BlockConfig.Custom {
+		s.loadCategoryFromDomains(CategoryCustom, s.config.CustomDomains)
 	}
 
 	// Log summary
@@ -220,10 +213,13 @@ func (s *Server) loadAllBlocklists() error {
 	return nil
 }
 
-func (s *Server) loadCategory(cat Category, urls []string) error {
+func (s *Server) loadCategoryFromURLs(cat Category, urls []string) {
 	domains := make(map[string]bool)
 
 	for _, url := range urls {
+		if url == "" {
+			continue
+		}
 		if err := s.fetchBlocklist(url, domains); err != nil {
 			log.Printf("Failed to fetch %s: %v", url, err)
 			continue
@@ -231,10 +227,44 @@ func (s *Server) loadCategory(cat Category, urls []string) error {
 	}
 
 	s.mu.Lock()
-	s.blocklists[cat] = domains
+	if existing, ok := s.blocklists[cat]; ok {
+		// Merge with existing
+		for d := range domains {
+			existing[d] = true
+		}
+	} else {
+		s.blocklists[cat] = domains
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) loadCategoryFromDomains(cat Category, domainList []string) {
+	if len(domainList) == 0 {
+		return
+	}
+
+	domains := make(map[string]bool)
+	for _, domain := range domainList {
+		domain = strings.TrimSpace(strings.ToLower(domain))
+		if domain == "" || strings.HasPrefix(domain, "#") {
+			continue
+		}
+		// Remove www. prefix if present
+		domain = strings.TrimPrefix(domain, "www.")
+		domains[domain] = true
+	}
+
+	s.mu.Lock()
+	if existing, ok := s.blocklists[cat]; ok {
+		for d := range domains {
+			existing[d] = true
+		}
+	} else {
+		s.blocklists[cat] = domains
+	}
 	s.mu.Unlock()
 
-	return nil
+	log.Printf("Loaded %d domains from environment for category %s", len(domains), cat)
 }
 
 func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
@@ -316,19 +346,22 @@ func (s *Server) checkBlock(domain string) (bool, Category, string) {
 
 func (s *Server) getAppName(domain string) string {
 	appMap := map[string]string{
-		"roblox.com":     "Roblox",
-		"rbxcdn.com":     "Roblox",
-		"facebook.com":   "Facebook",
-		"instagram.com":  "Instagram",
-		"twitter.com":    "Twitter/X",
-		"x.com":          "Twitter/X",
-		"tiktok.com":     "TikTok",
-		"youtube.com":    "YouTube",
-		"discord.com":    "Discord",
-		"discordapp.com": "Discord",
-		"epicgames.com":  "Epic Games",
-		"fortnite.com":   "Fortnite",
-		"minecraft.net":  "Minecraft",
+		"roblox.com":         "Roblox",
+		"rbxcdn.com":         "Roblox",
+		"facebook.com":       "Facebook",
+		"instagram.com":      "Instagram",
+		"twitter.com":        "Twitter/X",
+		"x.com":              "Twitter/X",
+		"tiktok.com":         "TikTok",
+		"youtube.com":        "YouTube",
+		"discord.com":        "Discord",
+		"discordapp.com":     "Discord",
+		"epicgames.com":      "Epic Games",
+		"fortnite.com":       "Fortnite",
+		"minecraft.net":      "Minecraft",
+		"netflix.com":        "Netflix",
+		"steamcommunity.com": "Steam",
+		"steampowered.com":   "Steam",
 	}
 
 	for d, app := range appMap {
@@ -585,6 +618,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .cat-box.social { border-color: #8b5cf6; }
         .cat-box.gaming { border-color: #f59e0b; }
         .cat-box.streaming { border-color: #ec4899; }
+        .cat-box.custom { border-color: #06b6d4; }
         
         .logs-container { 
             background: #1e293b; 
@@ -662,6 +696,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .cat-social { background: #8b5cf6; color: white; }
         .cat-gaming { background: #f59e0b; color: #0f172a; }
         .cat-streaming { background: #ec4899; color: white; }
+        .cat-custom { background: #06b6d4; color: white; }
         .log-app { color: #64748b; font-size: 0.8em; overflow: hidden; text-overflow: ellipsis; }
         
         .config { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
@@ -932,8 +967,6 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// MISSING FUNCTIONS ADDED HERE:
-
 func (s *Server) startRefreshLoop() {
 	ticker := time.NewTicker(24 * time.Hour)
 	go func() {
@@ -944,44 +977,43 @@ func (s *Server) startRefreshLoop() {
 	}()
 }
 
-func parseBlocklistURLs() []string {
-	urlsEnv := os.Getenv("BLOCKLIST_URLS")
-	if urlsEnv == "" {
-		return defaultBlocklists
+func parseCommaSeparated(envVar string) []string {
+	value := os.Getenv(envVar)
+	if value == "" {
+		return []string{}
 	}
 
-	urls := strings.Split(urlsEnv, ",")
+	parts := strings.Split(value, ",")
 	var result []string
-	for _, url := range urls {
-		url = strings.TrimSpace(url)
-		if url != "" {
-			result = append(result, url)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" && !strings.HasPrefix(part, "#") {
+			result = append(result, part)
 		}
 	}
-
-	if len(result) == 0 {
-		return defaultBlocklists
-	}
-
 	return result
 }
 
 func loadConfig() Config {
 	blockConfig := BlockConfig{
 		Ads:       getEnvBool("BLOCK_ADS", true),
-		Social:    getEnvBool("BLOCK_SOCIAL", true),
-		Gaming:    getEnvBool("BLOCK_GAMING", true),
+		Social:    getEnvBool("BLOCK_SOCIAL", false),
+		Gaming:    getEnvBool("BLOCK_GAMING", false),
 		Streaming: getEnvBool("BLOCK_STREAMING", false),
 		Custom:    getEnvBool("BLOCK_CUSTOM", false),
 	}
 
 	return Config{
-		Port:        getEnv("PORT", "10000"),
-		UpstreamDNS: []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"},
-		Blocklists:  parseBlocklistURLs(),
-		Whitelist:   []string{},
-		CacheSize:   5000,
-		BlockConfig: blockConfig,
+		Port:             getEnv("PORT", "10000"),
+		UpstreamDNS:      []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"},
+		Blocklists:       parseCommaSeparated("BLOCKLIST_URLS"),
+		Whitelist:        parseCommaSeparated("WHITELIST_DOMAINS"),
+		CacheSize:        5000,
+		BlockConfig:      blockConfig,
+		SocialDomains:    parseCommaSeparated("SOCIAL_DOMAINS"),
+		GamingDomains:    parseCommaSeparated("GAMING_DOMAINS"),
+		StreamingDomains: parseCommaSeparated("STREAMING_DOMAINS"),
+		CustomDomains:    parseCommaSeparated("CUSTOM_DOMAINS"),
 	}
 }
 
@@ -1009,13 +1041,16 @@ func main() {
 		log.Printf("  ✓ Ads")
 	}
 	if config.BlockConfig.Social {
-		log.Printf("  ✓ Social Media")
+		log.Printf("  ✓ Social Media (%d domains from env)", len(config.SocialDomains))
 	}
 	if config.BlockConfig.Gaming {
-		log.Printf("  ✓ Gaming")
+		log.Printf("  ✓ Gaming (%d domains from env)", len(config.GamingDomains))
 	}
 	if config.BlockConfig.Streaming {
-		log.Printf("  ✓ Streaming")
+		log.Printf("  ✓ Streaming (%d domains from env)", len(config.StreamingDomains))
+	}
+	if config.BlockConfig.Custom {
+		log.Printf("  ✓ Custom (%d domains from env)", len(config.CustomDomains))
 	}
 
 	if err := server.loadAllBlocklists(); err != nil {
