@@ -16,7 +16,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Default blocklists if none specified in environment
 var defaultBlocklists = []string{
 	"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 	"https://adaway.org/hosts.txt",
@@ -145,49 +144,36 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 		line := strings.TrimSpace(scanner.Text())
 		lineCount++
 
-		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
 			continue
 		}
 
-		// Handle different blocklist formats
-
-		// Format 1: Hosts file (0.0.0.0 domain.com or 127.0.0.1 domain.com)
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
 			ip := fields[0]
 			domain := strings.ToLower(fields[1])
 
-			// Only block if IP is 0.0.0.0, 127.0.0.1, or ::1 (localhost)
 			if ip == "0.0.0.0" || ip == "127.0.0.1" || ip == "::1" {
 				if domain != "localhost" && !strings.Contains(domain, "localhost") {
 					blocklist[domain] = true
 				}
 			}
 		} else if len(fields) == 1 {
-			// Format 2: Plain domain list (one domain per line)
 			domain := strings.ToLower(fields[0])
-
-			// Skip if it looks like an IP address or contains invalid chars
 			if !strings.Contains(domain, ".") || strings.Contains(domain, "/") {
 				continue
 			}
-
-			// Remove trailing dot if present
 			domain = strings.TrimSuffix(domain, ".")
 			blocklist[domain] = true
 		}
 
-		// Format 3: AdGuard/ABP filter syntax (||domain^)
 		if strings.HasPrefix(line, "||") && strings.HasSuffix(line, "^") {
 			domain := strings.ToLower(line[2 : len(line)-1])
 			domain = strings.TrimPrefix(domain, "www.")
 			blocklist[domain] = true
 		}
 
-		// Format 4: Domain with path (block just the domain part)
 		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
-			// Extract domain from URL
 			urlParts := strings.SplitN(line, "/", 3)
 			if len(urlParts) >= 2 {
 				domain := strings.ToLower(strings.Replace(urlParts[2], "www.", "", 1))
@@ -217,7 +203,6 @@ func (s *Server) isBlocked(domain string) bool {
 		return true
 	}
 
-	// Check subdomains
 	parts := strings.Split(domain, ".")
 	for i := 1; i < len(parts)-1; i++ {
 		parent := strings.Join(parts[i:], ".")
@@ -228,9 +213,62 @@ func (s *Server) isBlocked(domain string) bool {
 	return false
 }
 
-func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
+func (s *Server) processDNSQuery(msg *dns.Msg) (*dns.Msg, bool) {
+	if len(msg.Question) == 0 {
+		return msg, false
+	}
+
+	question := msg.Question[0]
+	domain := question.Name
+	qtype := question.Qtype
+
 	s.stats.TotalQueries++
 
+	cacheKey := fmt.Sprintf("%s:%d", domain, qtype)
+	if cached, found := s.cache.Get(cacheKey); found {
+		s.stats.CachedQueries++
+		cachedMsg := new(dns.Msg)
+		cachedMsg.Unpack(cached)
+		cachedMsg.Id = msg.Id
+		return cachedMsg, true
+	}
+
+	if s.isBlocked(domain) {
+		s.stats.BlockedQueries++
+		msg.Rcode = dns.RcodeNameError
+		msg.Response = true
+		msg.RecursionAvailable = true
+		log.Printf("[BLOCKED] %s", domain)
+		return msg, true
+	}
+
+	return nil, false
+}
+
+func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string) *dns.Msg {
+	response, err := s.forwardQuery(msg)
+	if err != nil {
+		log.Printf("Forward error: %v", err)
+		msg.Rcode = dns.RcodeServerFailure
+		msg.Response = true
+		msg.RecursionAvailable = true
+		return msg
+	}
+
+	packed, _ := response.Pack()
+	ttl := 300 * time.Second
+	if len(response.Answer) > 0 {
+		if a, ok := response.Answer[0].(*dns.A); ok {
+			ttl = time.Duration(a.Hdr.Ttl) * time.Second
+		}
+	}
+	s.cache.Set(cacheKey, packed, ttl)
+
+	return response
+}
+
+// HTTP handler for DoH (RFC 8484)
+func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var err error
 
@@ -262,56 +300,72 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(msg.Question) == 0 {
-		http.Error(w, "No question", http.StatusBadRequest)
-		return
-	}
-
-	question := msg.Question[0]
-	domain := question.Name
-
-	cacheKey := fmt.Sprintf("%s:%d", domain, question.Qtype)
-	if cached, found := s.cache.Get(cacheKey); found {
-		s.stats.CachedQueries++
-		w.Header().Set("Content-Type", "application/dns-message")
-		w.Write(cached)
-		return
-	}
-
-	if s.isBlocked(domain) {
-		s.stats.BlockedQueries++
-		msg.Rcode = dns.RcodeNameError
-		msg.Response = true
-
-		packed, _ := msg.Pack()
-		w.Header().Set("Content-Type", "application/dns-message")
-		w.Write(packed)
-		log.Printf("[BLOCKED] %s", domain)
-		return
-	}
-
-	response, err := s.forwardQuery(msg)
-	if err != nil {
-		log.Printf("Forward error: %v", err)
-		msg.Rcode = dns.RcodeServerFailure
-		msg.Response = true
-		packed, _ := msg.Pack()
+	result, fromCache := s.processDNSQuery(msg)
+	if fromCache {
+		packed, _ := result.Pack()
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Write(packed)
 		return
 	}
+
+	if result != nil && result.Rcode == dns.RcodeNameError {
+		packed, _ := result.Pack()
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Write(packed)
+		return
+	}
+
+	cacheKey := fmt.Sprintf("%s:%d", msg.Question[0].Name, msg.Question[0].Qtype)
+	response := s.forwardAndCache(msg, cacheKey)
 
 	packed, _ := response.Pack()
-	ttl := 300 * time.Second
-	if len(response.Answer) > 0 {
-		if a, ok := response.Answer[0].(*dns.A); ok {
-			ttl = time.Duration(a.Hdr.Ttl) * time.Second
-		}
-	}
-	s.cache.Set(cacheKey, packed, ttl)
-
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Write(packed)
+}
+
+// HTTP handler for simple DNS proxy (for Cloudflare Worker bridge)
+func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
+	domain := r.URL.Query().Get("name")
+	if domain == "" {
+		http.Error(w, "Missing name parameter", http.StatusBadRequest)
+		return
+	}
+
+	qtype := dns.TypeA
+	typeStr := r.URL.Query().Get("type")
+	if typeStr != "" {
+		switch strings.ToUpper(typeStr) {
+		case "AAAA":
+			qtype = dns.TypeAAAA
+		case "CNAME":
+			qtype = dns.TypeCNAME
+		case "MX":
+			qtype = dns.TypeMX
+		}
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(domain), qtype)
+
+	result, _ := s.processDNSQuery(msg)
+	if result != nil && result.Rcode == dns.RcodeNameError {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"blocked": true,
+			"domain":  domain,
+		})
+		return
+	}
+
+	cacheKey := fmt.Sprintf("%s:%d", dns.Fqdn(domain), qtype)
+	response := s.forwardAndCache(msg, cacheKey)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"domain":   domain,
+		"blocked":  false,
+		"response": response.Answer,
+	})
 }
 
 func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
@@ -327,11 +381,10 @@ func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	// Build blocklist info
 	blocklistHTML := ""
 	for i, url := range s.config.Blocklists {
 		blocklistHTML += fmt.Sprintf(`<li><code>%s</code></li>`, url)
-		if i >= 4 { // Show max 5
+		if i >= 4 {
 			blocklistHTML += fmt.Sprintf(`<li>... and %d more</li>`, len(s.config.Blocklists)-5)
 			break
 		}
@@ -361,11 +414,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         li { margin-bottom: 8px; }
         .badge { display: inline-block; background: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; margin-left: 10px; }
         .info-box { background: #334155; padding: 15px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #f59e0b; }
+        .bridge-info { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; border: 2px solid #38bdf8; }
     </style>
 </head>
 <body>
     <h1>🛡️ Render DoH AdBlocker <span class="badge">LIVE</span></h1>
-    <p class="subtitle">DNS-over-HTTPS ad blocker with customizable blocklists</p>
+    <p class="subtitle">DNS-over-HTTPS ad blocker with router support</p>
     
     <div class="stats">
         <div class="stat-box">
@@ -386,16 +440,20 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         </div>
     </div>
 
+    <div class="bridge-info">
+        <h3>🔗 Router Setup (No Pi Needed!)</h3>
+        <p><strong>Step 1:</strong> Deploy Cloudflare Worker bridge</p>
+        <p><strong>Step 2:</strong> Set router DNS to Cloudflare Worker URL</p>
+        <p><strong>Bridge URL:</strong> <span class="url">https://dns-bridge.YOUR_SUBDOMAIN.workers.dev</span></p>
+        <p><strong>Direct DoH:</strong> <span class="url">https://` + r.Host + `/dns-query</span></p>
+    </div>
+
     <div class="config">
-        <h3>🔗 Setup Instructions</h3>
-        <p><strong>DoH Endpoint:</strong><br><span class="url">https://` + r.Host + `/dns-query</span></p>
-        
-        <p><strong>Configure your devices:</strong></p>
+        <h3>📱 Device Setup</h3>
         <ul>
-            <li><strong>Android 9+:</strong> Settings → Network → Private DNS → <code>` + r.Host + `</code></li>
-            <li><strong>iOS:</strong> Install <em>DNSCloak</em> → Add custom DoH → <code>https://` + r.Host + `/dns-query</code></li>
-            <li><strong>Firefox:</strong> Settings → Privacy → DNS over HTTPS → <code>https://` + r.Host + `/dns-query</code></li>
-            <li><strong>Chrome:</strong> Settings → Security → Secure DNS → <code>https://` + r.Host + `/dns-query</code></li>
+            <li><strong>Android/iOS:</strong> Use direct DoH URL above</li>
+            <li><strong>Firefox/Chrome:</strong> Use direct DoH URL in settings</li>
+            <li><strong>Router:</strong> Use Cloudflare Worker bridge URL</li>
         </ul>
     </div>
 
@@ -403,9 +461,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         <h3>📋 Active Blocklists (` + fmt.Sprintf("%d", len(s.config.Blocklists)) + `)</h3>
         <ul>` + blocklistHTML + `</ul>
         <div class="info-box">
-            <strong>💡 Tip:</strong> Add BLOCKLIST_URLS environment variable in Render dashboard to customize. 
-            Use comma-separated URLs.<br>
-            <code>BLOCKLIST_URLS=https://example.com/list1.txt,https://example.com/list2.txt</code>
+            <strong>💡 Tip:</strong> Set BLOCKLIST_URLS env var in Render dashboard for custom lists
         </div>
     </div>
 
@@ -474,14 +530,12 @@ func (s *Server) startRefreshLoop() {
 	}()
 }
 
-// parseBlocklistURLs parses comma-separated URLs from environment variable
 func parseBlocklistURLs() []string {
 	urlsEnv := os.Getenv("BLOCKLIST_URLS")
 	if urlsEnv == "" {
 		return defaultBlocklists
 	}
 
-	// Split by comma and trim spaces
 	urls := strings.Split(urlsEnv, ",")
 	var result []string
 	for _, url := range urls {
@@ -520,7 +574,6 @@ func main() {
 	config := loadConfig()
 	server := NewServer(config)
 
-	// Log configuration
 	log.Printf("Starting with %d blocklists:", len(config.Blocklists))
 	for _, url := range config.Blocklists {
 		log.Printf("  - %s", url)
@@ -535,6 +588,7 @@ func main() {
 	http.HandleFunc("/api/stats", server.handleStats)
 	http.HandleFunc("/api/reload", server.handleReload)
 	http.HandleFunc("/dns-query", server.handleDoH)
+	http.HandleFunc("/dns", server.handleSimpleDNS) // Simple DNS for bridge
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
