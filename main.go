@@ -16,6 +16,13 @@ import (
 	"github.com/miekg/dns"
 )
 
+// Default blocklists if none specified in environment
+var defaultBlocklists = []string{
+	"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+	"https://adaway.org/hosts.txt",
+	"https://v.firebog.net/hosts/Easylist.txt",
+}
+
 type Config struct {
 	Port        string   `json:"port"`
 	UpstreamDNS []string `json:"upstream_dns"`
@@ -104,6 +111,7 @@ func (s *Server) loadBlocklists() error {
 	newBlocklist := make(map[string]bool)
 
 	for _, url := range s.config.Blocklists {
+		log.Printf("Loading: %s", url)
 		if err := s.fetchBlocklist(url, newBlocklist); err != nil {
 			log.Printf("Failed to load %s: %v", url, err)
 			continue
@@ -126,24 +134,74 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
 	scanner := bufio.NewScanner(resp.Body)
+	lineCount := 0
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		lineCount++
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
 			continue
 		}
 
+		// Handle different blocklist formats
+
+		// Format 1: Hosts file (0.0.0.0 domain.com or 127.0.0.1 domain.com)
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
+			ip := fields[0]
 			domain := strings.ToLower(fields[1])
-			if domain != "localhost" && !strings.Contains(domain, "localhost") {
-				blocklist[domain] = true
+
+			// Only block if IP is 0.0.0.0, 127.0.0.1, or ::1 (localhost)
+			if ip == "0.0.0.0" || ip == "127.0.0.1" || ip == "::1" {
+				if domain != "localhost" && !strings.Contains(domain, "localhost") {
+					blocklist[domain] = true
+				}
 			}
 		} else if len(fields) == 1 {
-			blocklist[strings.ToLower(fields[0])] = true
+			// Format 2: Plain domain list (one domain per line)
+			domain := strings.ToLower(fields[0])
+
+			// Skip if it looks like an IP address or contains invalid chars
+			if !strings.Contains(domain, ".") || strings.Contains(domain, "/") {
+				continue
+			}
+
+			// Remove trailing dot if present
+			domain = strings.TrimSuffix(domain, ".")
+			blocklist[domain] = true
+		}
+
+		// Format 3: AdGuard/ABP filter syntax (||domain^)
+		if strings.HasPrefix(line, "||") && strings.HasSuffix(line, "^") {
+			domain := strings.ToLower(line[2 : len(line)-1])
+			domain = strings.TrimPrefix(domain, "www.")
+			blocklist[domain] = true
+		}
+
+		// Format 4: Domain with path (block just the domain part)
+		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			// Extract domain from URL
+			urlParts := strings.SplitN(line, "/", 3)
+			if len(urlParts) >= 2 {
+				domain := strings.ToLower(strings.Replace(urlParts[2], "www.", "", 1))
+				blocklist[domain] = true
+			}
 		}
 	}
-	return scanner.Err()
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	log.Printf("Processed %d lines from %s", lineCount, url)
+	return nil
 }
 
 func (s *Server) isBlocked(domain string) bool {
@@ -159,8 +217,9 @@ func (s *Server) isBlocked(domain string) bool {
 		return true
 	}
 
+	// Check subdomains
 	parts := strings.Split(domain, ".")
-	for i := 1; i < len(parts); i++ {
+	for i := 1; i < len(parts)-1; i++ {
 		parent := strings.Join(parts[i:], ".")
 		if s.blocklist[parent] {
 			return true
@@ -268,6 +327,16 @@ func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	// Build blocklist info
+	blocklistHTML := ""
+	for i, url := range s.config.Blocklists {
+		blocklistHTML += fmt.Sprintf(`<li><code>%s</code></li>`, url)
+		if i >= 4 { // Show max 5
+			blocklistHTML += fmt.Sprintf(`<li>... and %d more</li>`, len(s.config.Blocklists)-5)
+			break
+		}
+	}
+
 	html := `<!DOCTYPE html>
 <html>
 <head>
@@ -283,18 +352,20 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .blocked { border-left-color: #ef4444; }
         .blocked .stat-value { color: #ef4444; }
         .config { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
-        code { background: #334155; padding: 2px 6px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 0.9em; }
+        .blocklists { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
+        code { background: #334155; padding: 2px 6px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 0.9em; word-break: break-all; }
         .url { word-break: break-all; color: #38bdf8; font-weight: 600; }
         button { background: #38bdf8; color: #0f172a; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 1em; margin-top: 10px; }
         button:hover { background: #7dd3fc; transform: translateY(-1px); }
         ul { line-height: 2; }
         li { margin-bottom: 8px; }
         .badge { display: inline-block; background: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; margin-left: 10px; }
+        .info-box { background: #334155; padding: 15px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #f59e0b; }
     </style>
 </head>
 <body>
     <h1>🛡️ Render DoH AdBlocker <span class="badge">LIVE</span></h1>
-    <p class="subtitle">DNS-over-HTTPS ad blocker running on Render's free tier</p>
+    <p class="subtitle">DNS-over-HTTPS ad blocker with customizable blocklists</p>
     
     <div class="stats">
         <div class="stat-box">
@@ -310,8 +381,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             <div class="stat-value" id="cached">0</div>
         </div>
         <div class="stat-box">
-            <div>Uptime</div>
-            <div class="stat-value" id="uptime">0s</div>
+            <div>Blocklist Size</div>
+            <div class="stat-value" id="blocklistSize">0</div>
         </div>
     </div>
 
@@ -321,11 +392,21 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         
         <p><strong>Configure your devices:</strong></p>
         <ul>
-            <li><strong>Android 9+:</strong> Settings → Network → Private DNS → Enter hostname: <code>` + r.Host + `</code></li>
-            <li><strong>iOS:</strong> Install <em>DNSCloak</em> app → Add custom DoH → URL: <code>https://` + r.Host + `/dns-query</code></li>
-            <li><strong>Firefox:</strong> Settings → Privacy & Security → Enable DNS over HTTPS → Custom provider: <code>https://` + r.Host + `/dns-query</code></li>
-            <li><strong>Chrome:</strong> Settings → Security → Secure DNS → Custom → <code>https://` + r.Host + `/dns-query</code></li>
+            <li><strong>Android 9+:</strong> Settings → Network → Private DNS → <code>` + r.Host + `</code></li>
+            <li><strong>iOS:</strong> Install <em>DNSCloak</em> → Add custom DoH → <code>https://` + r.Host + `/dns-query</code></li>
+            <li><strong>Firefox:</strong> Settings → Privacy → DNS over HTTPS → <code>https://` + r.Host + `/dns-query</code></li>
+            <li><strong>Chrome:</strong> Settings → Security → Secure DNS → <code>https://` + r.Host + `/dns-query</code></li>
         </ul>
+    </div>
+
+    <div class="blocklists">
+        <h3>📋 Active Blocklists (` + fmt.Sprintf("%d", len(s.config.Blocklists)) + `)</h3>
+        <ul>` + blocklistHTML + `</ul>
+        <div class="info-box">
+            <strong>💡 Tip:</strong> Add BLOCKLIST_URLS environment variable in Render dashboard to customize. 
+            Use comma-separated URLs.<br>
+            <code>BLOCKLIST_URLS=https://example.com/list1.txt,https://example.com/list2.txt</code>
+        </div>
     </div>
 
     <button onclick="refresh()">🔄 Refresh Stats</button>
@@ -338,7 +419,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 document.getElementById('total').textContent = data.total_queries.toLocaleString();
                 document.getElementById('blocked').textContent = data.blocked_queries.toLocaleString();
                 document.getElementById('cached').textContent = data.cached_queries.toLocaleString();
-                document.getElementById('uptime').textContent = data.uptime;
+                document.getElementById('blocklistSize').textContent = data.blocklist_size.toLocaleString();
             } catch (e) {
                 console.error('Failed to fetch stats:', e);
             }
@@ -367,26 +448,64 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(stats)
 }
 
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	log.Println("Manual blocklist reload requested")
+	if err := s.loadBlocklists(); err != nil {
+		http.Error(w, fmt.Sprintf("Reload failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "reloaded", "domains": fmt.Sprintf("%d", len(s.blocklist))})
+}
+
 func (s *Server) startRefreshLoop() {
 	ticker := time.NewTicker(24 * time.Hour)
 	go func() {
 		for range ticker.C {
+			log.Println("Auto-refreshing blocklists...")
 			s.loadBlocklists()
 		}
 	}()
+}
+
+// parseBlocklistURLs parses comma-separated URLs from environment variable
+func parseBlocklistURLs() []string {
+	urlsEnv := os.Getenv("BLOCKLIST_URLS")
+	if urlsEnv == "" {
+		return defaultBlocklists
+	}
+
+	// Split by comma and trim spaces
+	urls := strings.Split(urlsEnv, ",")
+	var result []string
+	for _, url := range urls {
+		url = strings.TrimSpace(url)
+		if url != "" {
+			result = append(result, url)
+		}
+	}
+
+	if len(result) == 0 {
+		return defaultBlocklists
+	}
+
+	log.Printf("Using %d custom blocklists from environment", len(result))
+	return result
 }
 
 func loadConfig() Config {
 	return Config{
 		Port:        getEnv("PORT", "10000"),
 		UpstreamDNS: []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"},
-		Blocklists: []string{
-			"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-			"https://adaway.org/hosts.txt",
-			"https://v.firebog.net/hosts/Easylist.txt",
-		},
-		Whitelist: []string{},
-		CacheSize: 5000,
+		Blocklists:  parseBlocklistURLs(),
+		Whitelist:   []string{},
+		CacheSize:   5000,
 	}
 }
 
@@ -401,6 +520,12 @@ func main() {
 	config := loadConfig()
 	server := NewServer(config)
 
+	// Log configuration
+	log.Printf("Starting with %d blocklists:", len(config.Blocklists))
+	for _, url := range config.Blocklists {
+		log.Printf("  - %s", url)
+	}
+
 	if err := server.loadBlocklists(); err != nil {
 		log.Printf("Warning: %v", err)
 	}
@@ -408,6 +533,7 @@ func main() {
 
 	http.HandleFunc("/", server.handleDashboard)
 	http.HandleFunc("/api/stats", server.handleStats)
+	http.HandleFunc("/api/reload", server.handleReload)
 	http.HandleFunc("/dns-query", server.handleDoH)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -415,8 +541,7 @@ func main() {
 	})
 
 	port := config.Port
-	log.Printf("Starting DoH server on port %s", port)
-	log.Printf("Dashboard: http://localhost:%s", port)
+	log.Printf("Server starting on port %s", port)
 
 	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
