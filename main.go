@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -23,12 +22,11 @@ var defaultBlocklists = []string{
 	"https://v.firebog.net/hosts/Easylist.txt",
 }
 
-// LogEntry represents a single DNS query log
 type LogEntry struct {
 	Timestamp string `json:"timestamp"`
 	Domain    string `json:"domain"`
 	Type      string `json:"type"`
-	Action    string `json:"action"` // "blocked", "cached", "forwarded", "error"
+	Action    string `json:"action"`
 	ClientIP  string `json:"client_ip"`
 	Reason    string `json:"reason,omitempty"`
 }
@@ -50,15 +48,11 @@ type Server struct {
 	mu        sync.RWMutex
 	stats     Stats
 	startTime time.Time
-	
-	// Live log storage (circular buffer)
-	logs     []LogEntry
-	logsMu   sync.RWMutex
-	maxLogs  int
-	
-	// SSE clients
-	clients     map[chan LogEntry]bool
-	clientsMu   sync.RWMutex
+	logs      []LogEntry
+	logsMu    sync.RWMutex
+	maxLogs   int
+	clients   map[chan LogEntry]bool
+	clientsMu sync.RWMutex
 }
 
 type Stats struct {
@@ -73,7 +67,7 @@ type Cache struct {
 	size  int
 }
 
-type cacheEntry struct {
+type cacheItem struct {
 	data     []byte
 	expireAt time.Time
 }
@@ -114,7 +108,7 @@ func NewServer(config Config) *Server {
 	for _, w := range config.Whitelist {
 		whitelist[strings.ToLower(w)] = true
 	}
-	
+
 	return &Server{
 		config:    config,
 		blocklist: make(map[string]bool),
@@ -123,30 +117,24 @@ func NewServer(config Config) *Server {
 		upstream:  config.UpstreamDNS,
 		startTime: time.Now(),
 		logs:      make([]LogEntry, 0),
-		maxLogs:   1000, // Keep last 1000 entries
+		maxLogs:   1000,
 		clients:   make(map[chan LogEntry]bool),
 	}
 }
 
 func (s *Server) addLog(entry LogEntry) {
 	s.logsMu.Lock()
-	
-	// Add to circular buffer
 	s.logs = append(s.logs, entry)
 	if len(s.logs) > s.maxLogs {
-		s.logs = s.logs[1:] // Remove oldest
+		s.logs = s.logs[1:]
 	}
-	
 	s.logsMu.Unlock()
-	
-	// Broadcast to SSE clients
+
 	s.clientsMu.RLock()
 	for client := range s.clients {
 		select {
 		case client <- entry:
-			// Sent successfully
 		default:
-			// Channel full, skip
 		}
 	}
 	s.clientsMu.RUnlock()
@@ -155,7 +143,7 @@ func (s *Server) addLog(entry LogEntry) {
 func (s *Server) loadBlocklists() error {
 	log.Println("Fetching blocklists...")
 	newBlocklist := make(map[string]bool)
-	
+
 	for _, url := range s.config.Blocklists {
 		log.Printf("Loading: %s", url)
 		if err := s.fetchBlocklist(url, newBlocklist); err != nil {
@@ -163,11 +151,11 @@ func (s *Server) loadBlocklists() error {
 			continue
 		}
 	}
-	
+
 	s.mu.Lock()
 	s.blocklist = newBlocklist
 	s.mu.Unlock()
-	
+
 	log.Printf("Loaded %d blocked domains", len(newBlocklist))
 	return nil
 }
@@ -179,27 +167,27 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	
+
 	scanner := bufio.NewScanner(resp.Body)
 	lineCount := 0
-	
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		lineCount++
-		
+
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
 			continue
 		}
-		
+
 		fields := strings.Fields(line)
 		if len(fields) >= 2 {
 			ip := fields[0]
 			domain := strings.ToLower(fields[1])
-			
+
 			if ip == "0.0.0.0" || ip == "127.0.0.1" || ip == "::1" {
 				if domain != "localhost" && !strings.Contains(domain, "localhost") {
 					blocklist[domain] = true
@@ -213,13 +201,13 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 			domain = strings.TrimSuffix(domain, ".")
 			blocklist[domain] = true
 		}
-		
+
 		if strings.HasPrefix(line, "||") && strings.HasSuffix(line, "^") {
 			domain := strings.ToLower(line[2 : len(line)-1])
 			domain = strings.TrimPrefix(domain, "www.")
 			blocklist[domain] = true
 		}
-		
+
 		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
 			urlParts := strings.SplitN(line, "/", 3)
 			if len(urlParts) >= 2 {
@@ -228,11 +216,11 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 			}
 		}
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	
+
 	log.Printf("Processed %d lines from %s", lineCount, url)
 	return nil
 }
@@ -240,16 +228,16 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 func (s *Server) isBlocked(domain string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
-	
+
 	if s.whitelist[domain] {
 		return false
 	}
 	if s.blocklist[domain] {
 		return true
 	}
-	
+
 	parts := strings.Split(domain, ".")
 	for i := 1; i < len(parts)-1; i++ {
 		parent := strings.Join(parts[i:], ".")
@@ -264,24 +252,23 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 	if len(msg.Question) == 0 {
 		return msg, false, "no question"
 	}
-	
+
 	question := msg.Question[0]
 	domain := question.Name
 	qtype := dns.TypeToString[question.Qtype]
 	if qtype == "" {
 		qtype = fmt.Sprintf("TYPE%d", question.Qtype)
 	}
-	
+
 	s.stats.TotalQueries++
-	
+
 	cacheKey := fmt.Sprintf("%s:%d", domain, question.Qtype)
 	if cached, found := s.cache.Get(cacheKey); found {
 		s.stats.CachedQueries++
 		cachedMsg := new(dns.Msg)
 		cachedMsg.Unpack(cached)
 		cachedMsg.Id = msg.Id
-		
-		// Log cache hit
+
 		s.addLog(LogEntry{
 			Timestamp: time.Now().Format("15:04:05"),
 			Domain:    strings.TrimSuffix(domain, "."),
@@ -289,17 +276,16 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 			Action:    "cached",
 			ClientIP:  clientIP,
 		})
-		
+
 		return cachedMsg, true, "cache hit"
 	}
-	
+
 	if s.isBlocked(domain) {
 		s.stats.BlockedQueries++
 		msg.Rcode = dns.RcodeNameError
 		msg.Response = true
 		msg.RecursionAvailable = true
-		
-		// Log block
+
 		s.addLog(LogEntry{
 			Timestamp: time.Now().Format("15:04:05"),
 			Domain:    strings.TrimSuffix(domain, "."),
@@ -308,16 +294,16 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 			ClientIP:  clientIP,
 			Reason:    "blocklist",
 		})
-		
+
 		return msg, true, "blocked"
 	}
-	
+
 	return nil, false, "forward"
 }
 
 func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string) *dns.Msg {
 	response, err := s.forwardQuery(msg)
-	
+
 	qtype := "A"
 	if len(msg.Question) > 0 {
 		qtype = dns.TypeToString[msg.Question[0].Qtype]
@@ -326,13 +312,13 @@ func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string)
 	if len(msg.Question) > 0 {
 		domain = strings.TrimSuffix(msg.Question[0].Name, ".")
 	}
-	
+
 	if err != nil {
 		log.Printf("Forward error: %v", err)
 		msg.Rcode = dns.RcodeServerFailure
 		msg.Response = true
 		msg.RecursionAvailable = true
-		
+
 		s.addLog(LogEntry{
 			Timestamp: time.Now().Format("15:04:05"),
 			Domain:    domain,
@@ -341,10 +327,10 @@ func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string)
 			ClientIP:  clientIP,
 			Reason:    err.Error(),
 		})
-		
+
 		return msg
 	}
-	
+
 	packed, _ := response.Pack()
 	ttl := 300 * time.Second
 	if len(response.Answer) > 0 {
@@ -353,8 +339,7 @@ func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string)
 		}
 	}
 	s.cache.Set(cacheKey, packed, ttl)
-	
-	// Log forward
+
 	s.addLog(LogEntry{
 		Timestamp: time.Now().Format("15:04:05"),
 		Domain:    domain,
@@ -362,7 +347,7 @@ func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string)
 		Action:    "forwarded",
 		ClientIP:  clientIP,
 	})
-	
+
 	return response
 }
 
@@ -371,10 +356,10 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	if clientIP == "" {
 		clientIP = r.RemoteAddr
 	}
-	
+
 	var body []byte
 	var err error
-	
+
 	if r.Method == http.MethodGet {
 		dnsParam := r.URL.Query().Get("dns")
 		if dnsParam == "" {
@@ -396,13 +381,13 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	msg := new(dns.Msg)
 	if err := msg.Unpack(body); err != nil {
 		http.Error(w, "Invalid DNS message", http.StatusBadRequest)
 		return
 	}
-	
+
 	result, fromCache, action := s.processDNSQuery(msg, clientIP)
 	if fromCache {
 		packed, _ := result.Pack()
@@ -410,17 +395,17 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		w.Write(packed)
 		return
 	}
-	
+
 	if action == "blocked" {
 		packed, _ := result.Pack()
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Write(packed)
 		return
 	}
-	
+
 	cacheKey := fmt.Sprintf("%s:%d", msg.Question[0].Name, msg.Question[0].Qtype)
 	response := s.forwardAndCache(msg, cacheKey, clientIP)
-	
+
 	packed, _ := response.Pack()
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Write(packed)
@@ -432,7 +417,7 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing name parameter", http.StatusBadRequest)
 		return
 	}
-	
+
 	qtype := dns.TypeA
 	typeStr := r.URL.Query().Get("type")
 	if typeStr != "" {
@@ -445,15 +430,15 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 			qtype = dns.TypeMX
 		}
 	}
-	
+
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(domain), qtype)
-	
+
 	clientIP := r.Header.Get("X-Forwarded-For")
 	if clientIP == "" {
 		clientIP = r.RemoteAddr
 	}
-	
+
 	result, _, action := s.processDNSQuery(msg, clientIP)
 	if action == "blocked" {
 		w.Header().Set("Content-Type", "application/json")
@@ -464,10 +449,10 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	
+
 	cacheKey := fmt.Sprintf("%s:%d", dns.Fqdn(domain), qtype)
 	response := s.forwardAndCache(msg, cacheKey, clientIP)
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"domain":   domain,
@@ -479,7 +464,7 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
 	c := &dns.Client{Timeout: 5 * time.Second}
-	
+
 	for _, server := range s.upstream {
 		m, _, err := c.Exchange(r, server)
 		if err == nil {
@@ -492,14 +477,19 @@ func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	blocklistHTML := ""
 	for i, url := range s.config.Blocklists {
-		blocklistHTML += fmt.Sprintf(`<li><code>%s</code></li>`, url)
+		blocklistHTML += fmt.Sprintf("<li><code>%s</code></li>", url)
 		if i >= 4 {
-			blocklistHTML += fmt.Sprintf(`<li>... and %d more</li>`, len(s.config.Blocklists)-5)
+			remaining := len(s.config.Blocklists) - 5
+			if remaining > 0 {
+				blocklistHTML += fmt.Sprintf("<li>... and %d more</li>", remaining)
+			}
 			break
 		}
 	}
-	
-	html := `<!DOCTYPE html>
+
+	host := r.Host
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
     <title>Render DoH AdBlocker - Live Logs</title>
@@ -622,11 +612,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         button:hover { background: #7dd3fc; }
         ul { line-height: 2; }
         .badge { display: inline-block; background: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 0.85em; font-weight: 600; margin-left: 10px; }
-        .status-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+        .status-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%%; margin-right: 5px; }
         .status-live { background: #10b981; animation: pulse 2s infinite; }
         @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            0%%, 100%% { opacity: 1; }
+            50%% { opacity: 0.5; }
         }
         .filter-group { display: flex; gap: 5px; }
     </style>
@@ -658,8 +648,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             
             <div class="config" style="margin-top: 20px;">
                 <h3>🔗 Connection Info</h3>
-                <p><strong>DoH Endpoint:</strong><br><span class="url">https://`+r.Host+`/dns-query</span></p>
-                <p><strong>Simple API:</strong><br><span class="url">https://`+r.Host+`/dns?name=example.com</span></p>
+                <p><strong>DoH Endpoint:</strong><br><span class="url">https://%s/dns-query</span></p>
+                <p><strong>Simple API:</strong><br><span class="url">https://%s/dns?name=example.com</span></p>
             </div>
         </div>
         
@@ -684,8 +674,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
     </div>
 
     <div class="blocklists">
-        <h3>📋 Active Blocklists (`+fmt.Sprintf("%d", len(s.config.Blocklists))+`)</h3>
-        <ul>`+blocklistHTML+`</ul>
+        <h3>📋 Active Blocklists (%d)</h3>
+        <ul>%s</ul>
     </div>
 
     <script>
@@ -713,24 +703,20 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         function addLogEntry(entry) {
             const logsDiv = document.getElementById('logs');
             
-            // Apply filter
             if (currentFilter !== 'all' && entry.action !== currentFilter) {
                 return;
             }
             
             const div = document.createElement('div');
             div.className = 'log-entry';
-            div.innerHTML = `
-                <span class="log-time">${entry.timestamp}</span>
-                <span class="log-type">${entry.type}</span>
-                <span class="log-domain" title="${entry.domain}">${entry.domain}</span>
-                <span class="log-action action-${entry.action}">${entry.action.toUpperCase()}</span>
-                <span class="log-client">${entry.client_ip.split(':')[0]}</span>
-            `;
+            div.innerHTML = '<span class="log-time">' + entry.timestamp + '</span>' +
+                '<span class="log-type">' + entry.type + '</span>' +
+                '<span class="log-domain" title="' + entry.domain + '">' + entry.domain + '</span>' +
+                '<span class="log-action action-' + entry.action + '">' + entry.action.toUpperCase() + '</span>' +
+                '<span class="log-client">' + entry.client_ip.split(':')[0] + '</span>';
             
             logsDiv.insertBefore(div, logsDiv.firstChild);
             
-            // Keep only last 100 visible entries
             while (logsDiv.children.length > 100) {
                 logsDiv.removeChild(logsDiv.lastChild);
             }
@@ -740,14 +726,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         
         function filterLogs(type) {
             currentFilter = type;
-            
-            // Update buttons
             document.querySelectorAll('.filter-group .btn').forEach(btn => {
                 btn.classList.remove('active');
             });
             document.getElementById('filter-' + type).classList.add('active');
-            
-            // Clear and reload (simplified - just clear for now)
             document.getElementById('logs').innerHTML = '';
             logCount = 0;
         }
@@ -775,7 +757,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             }
         }
         
-        // Load recent logs on startup
         async function loadRecentLogs() {
             try {
                 const res = await fetch('/api/logs');
@@ -786,14 +767,14 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             }
         }
         
-        // Start
         loadRecentLogs();
         connectSSE();
         updateStats();
         setInterval(updateStats, 5000);
     </script>
 </body>
-</html>`
+</html>`, host, host, len(s.config.Blocklists), blocklistHTML)
+
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(html))
 }
@@ -808,7 +789,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"blocklist_size":  len(s.blocklist),
 	}
 	s.mu.RUnlock()
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
 }
@@ -818,7 +799,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	logs := make([]LogEntry, len(s.logs))
 	copy(logs, s.logs)
 	s.logsMu.RUnlock()
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(logs)
 }
@@ -827,33 +808,30 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	
-	// Create client channel
+
 	client := make(chan LogEntry, 100)
-	
+
 	s.clientsMu.Lock()
 	s.clients[client] = true
 	s.clientsMu.Unlock()
-	
+
 	defer func() {
 		s.clientsMu.Lock()
 		delete(s.clients, client)
 		s.clientsMu.Unlock()
 		close(client)
 	}()
-	
-	// Flush headers
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
 	flusher.Flush()
-	
-	// Send keepalive and wait for logs
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case entry, ok := <-client:
@@ -863,12 +841,11 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 			data, _ := json.Marshal(entry)
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
-			
+
 		case <-ticker.C:
-			// Send keepalive comment
 			fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()
-			
+
 		case <-r.Context().Done():
 			return
 		}
@@ -880,16 +857,16 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	log.Println("Manual blocklist reload requested")
 	if err := s.loadBlocklists(); err != nil {
 		http.Error(w, fmt.Sprintf("Reload failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "reloaded", 
+		"status":  "reloaded",
 		"domains": fmt.Sprintf("%d", len(s.blocklist)),
 	})
 }
@@ -909,7 +886,7 @@ func parseBlocklistURLs() []string {
 	if urlsEnv == "" {
 		return defaultBlocklists
 	}
-	
+
 	urls := strings.Split(urlsEnv, ",")
 	var result []string
 	for _, url := range urls {
@@ -918,11 +895,11 @@ func parseBlocklistURLs() []string {
 			result = append(result, url)
 		}
 	}
-	
+
 	if len(result) == 0 {
 		return defaultBlocklists
 	}
-	
+
 	log.Printf("Using %d custom blocklists from environment", len(result))
 	return result
 }
@@ -947,18 +924,17 @@ func getEnv(key, fallback string) string {
 func main() {
 	config := loadConfig()
 	server := NewServer(config)
-	
+
 	log.Printf("Starting with %d blocklists:", len(config.Blocklists))
 	for _, url := range config.Blocklists {
 		log.Printf("  - %s", url)
 	}
-	
+
 	if err := server.loadBlocklists(); err != nil {
 		log.Printf("Warning: %v", err)
 	}
 	server.startRefreshLoop()
-	
-	// Routes
+
 	http.HandleFunc("/", server.handleDashboard)
 	http.HandleFunc("/api/stats", server.handleStats)
 	http.HandleFunc("/api/logs", server.handleLogs)
@@ -970,11 +946,11 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
-	
+
 	port := config.Port
 	log.Printf("Server starting on port %s", port)
 	log.Printf("Dashboard: http://localhost:%s", port)
-	
+
 	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
