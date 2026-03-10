@@ -948,7 +948,7 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPOST {
+	if r.Method != http.MethodPost { // ✅ Fixed: was http.MethodPOST
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
