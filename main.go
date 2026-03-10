@@ -72,6 +72,7 @@ type Server struct {
 	upstream   []string
 	mu         sync.RWMutex
 	stats      Stats
+	statsMu    sync.Mutex // Separate mutex for stats
 	startTime  time.Time
 	logs       []LogEntry
 	logsMu     sync.RWMutex
@@ -381,11 +382,17 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 		qtype = fmt.Sprintf("TYPE%d", question.Qtype)
 	}
 
+	// Update stats with proper locking
+	s.statsMu.Lock()
 	s.stats.TotalQueries++
+	s.statsMu.Unlock()
 
 	cacheKey := fmt.Sprintf("%s:%d", domain, question.Qtype)
 	if cached, found := s.cache.Get(cacheKey); found {
+		s.statsMu.Lock()
 		s.stats.CachedQueries++
+		s.statsMu.Unlock()
+
 		cachedMsg := new(dns.Msg)
 		cachedMsg.Unpack(cached)
 		cachedMsg.Id = msg.Id
@@ -403,8 +410,11 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 
 	blocked, category, reason := s.checkBlock(domain)
 	if blocked {
+		// Update stats with proper locking
+		s.statsMu.Lock()
 		s.stats.BlockedQueries++
 		s.stats.ByCategory[string(category)]++
+		s.statsMu.Unlock()
 
 		msg.Rcode = dns.RcodeNameError
 		msg.Response = true
@@ -865,7 +875,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
+	s.statsMu.Lock()
 	stats := map[string]interface{}{
 		"total_queries":   s.stats.TotalQueries,
 		"blocked_queries": s.stats.BlockedQueries,
@@ -873,7 +883,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"uptime":          time.Since(s.startTime).Round(time.Second).String(),
 		"by_category":     s.stats.ByCategory,
 	}
-	s.mu.RUnlock()
+	s.statsMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
@@ -938,7 +948,7 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPOST {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
