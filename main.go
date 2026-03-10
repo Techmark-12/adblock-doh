@@ -74,7 +74,7 @@ type cacheItem struct {
 
 func NewCache(size int) *Cache {
 	return &Cache{
-		items: make(map[string]cacheEntry),
+		items: make(map[string]cacheItem),
 		size:  size,
 	}
 }
@@ -100,7 +100,7 @@ func (c *Cache) Set(key string, data []byte, ttl time.Duration) {
 			}
 		}
 	}
-	c.items[key] = cacheEntry{data: data, expireAt: time.Now().Add(ttl)}
+	c.items[key] = cacheItem{data: data, expireAt: time.Now().Add(ttl)}
 }
 
 func NewServer(config Config) *Server {
@@ -440,6 +440,7 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, _, action := s.processDNSQuery(msg, clientIP)
+
 	if action == "blocked" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -447,6 +448,7 @@ func (s *Server) handleSimpleDNS(w http.ResponseWriter, r *http.Request) {
 			"type":    typeStr,
 			"blocked": true,
 		})
+		_ = result // Use result to avoid unused variable error
 		return
 	}
 
