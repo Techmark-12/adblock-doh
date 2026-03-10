@@ -76,7 +76,7 @@ type Config struct {
 
 type Server struct {
 	config     Config
-	blocklists map[Category]map[string]bool // category -> domains
+	blocklists map[Category]map[string]bool
 	whitelist  map[string]bool
 	cache      *Cache
 	upstream   []string
@@ -250,11 +250,9 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
-	lineCount := 0
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		lineCount++
 
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
 			continue
@@ -286,7 +284,6 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 		}
 	}
 
-	log.Printf("Loaded %d domains from %s", len(blocklist), url)
 	return scanner.Err()
 }
 
@@ -300,14 +297,11 @@ func (s *Server) checkBlock(domain string) (bool, Category, string) {
 		return false, "", "whitelisted"
 	}
 
-	// Check each category
 	for cat, domains := range s.blocklists {
-		// Exact match
 		if domains[domain] {
 			return true, cat, "exact match"
 		}
 
-		// Subdomain match
 		parts := strings.Split(domain, ".")
 		for i := 1; i < len(parts); i++ {
 			parent := strings.Join(parts[i:], ".")
@@ -321,7 +315,6 @@ func (s *Server) checkBlock(domain string) (bool, Category, string) {
 }
 
 func (s *Server) getAppName(domain string) string {
-	// Map domains to app names for better logging
 	appMap := map[string]string{
 		"roblox.com":     "Roblox",
 		"rbxcdn.com":     "Roblox",
@@ -360,7 +353,6 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 
 	s.stats.TotalQueries++
 
-	// Check cache
 	cacheKey := fmt.Sprintf("%s:%d", domain, question.Qtype)
 	if cached, found := s.cache.Get(cacheKey); found {
 		s.stats.CachedQueries++
@@ -379,7 +371,6 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 		return cachedMsg, true, "cache hit", ""
 	}
 
-	// Check blocklists
 	blocked, category, reason := s.checkBlock(domain)
 	if blocked {
 		s.stats.BlockedQueries++
@@ -541,7 +532,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	host := r.Host
 
-	// Build category HTML
 	catHTML := ""
 	for cat, count := range categories {
 		catHTML += fmt.Sprintf("<div class='cat-box %s'><strong>%s</strong><br>%d domains</div>", cat, strings.ToUpper(cat), count)
@@ -681,19 +671,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .status-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%%; margin-right: 5px; }
         .status-live { background: #10b981; animation: pulse 2s infinite; }
         @keyframes pulse { 0%%, 100%% { opacity: 1; } 50%% { opacity: 0.5; } }
-        
-        .toggle-container { display: flex; gap: 15px; flex-wrap: wrap; margin: 15px 0; }
-        .toggle {
-            background: #334155;
-            padding: 10px 15px;
-            border-radius: 6px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .toggle.active { background: #38bdf8; color: #0f172a; }
-        .toggle input { margin: 0; }
     </style>
 </head>
 <body>
@@ -729,7 +706,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 <h3>🔗 Setup</h3>
                 <p><strong>DoH URL:</strong><br><span class="url">https://%s/dns-query</span></p>
                 <p><strong>iOS/Android:</strong> Use AdGuard DNS app</p>
-                <p><strong>Windows/Mac:</strong> Use YogaDNS or system settings</p>
             </div>
         </div>
         
@@ -777,7 +753,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         function addLogEntry(entry) {
             const logsDiv = document.getElementById('logs');
             
-            // Filter logic
             if (currentFilter === 'blocked' && entry.action !== 'blocked') return;
             if (currentFilter === 'ads' && entry.category !== 'ads') return;
             if (currentFilter === 'social' && entry.category !== 'social') return;
@@ -957,8 +932,41 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// MISSING FUNCTIONS ADDED HERE:
+
+func (s *Server) startRefreshLoop() {
+	ticker := time.NewTicker(24 * time.Hour)
+	go func() {
+		for range ticker.C {
+			log.Println("Auto-refreshing blocklists...")
+			s.loadAllBlocklists()
+		}
+	}()
+}
+
+func parseBlocklistURLs() []string {
+	urlsEnv := os.Getenv("BLOCKLIST_URLS")
+	if urlsEnv == "" {
+		return defaultBlocklists
+	}
+
+	urls := strings.Split(urlsEnv, ",")
+	var result []string
+	for _, url := range urls {
+		url = strings.TrimSpace(url)
+		if url != "" {
+			result = append(result, url)
+		}
+	}
+
+	if len(result) == 0 {
+		return defaultBlocklists
+	}
+
+	return result
+}
+
 func loadConfig() Config {
-	// Parse block config from env
 	blockConfig := BlockConfig{
 		Ads:       getEnvBool("BLOCK_ADS", true),
 		Social:    getEnvBool("BLOCK_SOCIAL", true),
