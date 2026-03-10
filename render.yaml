@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: adblock-doh
+    runtime: go
+    buildCommand: go build -o server main.go
+    startCommand: ./server
+    envVars:
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
+    plan: free
