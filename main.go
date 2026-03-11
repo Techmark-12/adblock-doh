@@ -72,13 +72,16 @@ type Server struct {
 	upstream   []string
 	mu         sync.RWMutex
 	stats      Stats
-	statsMu    sync.Mutex // Separate mutex for stats
+	statsMu    sync.Mutex
 	startTime  time.Time
 	logs       []LogEntry
 	logsMu     sync.RWMutex
 	maxLogs    int
 	clients    map[chan LogEntry]bool
 	clientsMu  sync.RWMutex
+	// Dynamic config for toggles
+	dynamicConfig BlockConfig
+	configMu      sync.RWMutex
 }
 
 type Stats struct {
@@ -137,15 +140,16 @@ func NewServer(config Config) *Server {
 	}
 
 	return &Server{
-		config:     config,
-		blocklists: make(map[Category]map[string]bool),
-		whitelist:  whitelist,
-		cache:      NewCache(config.CacheSize),
-		upstream:   config.UpstreamDNS,
-		startTime:  time.Now(),
-		logs:       make([]LogEntry, 0),
-		maxLogs:    1000,
-		clients:    make(map[chan LogEntry]bool),
+		config:        config,
+		dynamicConfig: config.BlockConfig, // Initialize with env config
+		blocklists:    make(map[Category]map[string]bool),
+		whitelist:     whitelist,
+		cache:         NewCache(config.CacheSize),
+		upstream:      config.UpstreamDNS,
+		startTime:     time.Now(),
+		logs:          make([]LogEntry, 0),
+		maxLogs:       1000,
+		clients:       make(map[chan LogEntry]bool),
 		stats: Stats{
 			ByCategory: make(map[string]int64),
 		},
@@ -168,6 +172,84 @@ func (s *Server) addLog(entry LogEntry) {
 		}
 	}
 	s.clientsMu.RUnlock()
+}
+
+func (s *Server) isCategoryEnabled(cat Category) bool {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+
+	switch cat {
+	case CategoryAds:
+		return s.dynamicConfig.Ads
+	case CategorySocial:
+		return s.dynamicConfig.Social
+	case CategoryGaming:
+		return s.dynamicConfig.Gaming
+	case CategoryStreaming:
+		return s.dynamicConfig.Streaming
+	case CategoryCustom:
+		return s.dynamicConfig.Custom
+	}
+	return false
+}
+
+func (s *Server) toggleCategory(cat Category, enabled bool) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	switch cat {
+	case CategoryAds:
+		s.dynamicConfig.Ads = enabled
+	case CategorySocial:
+		s.dynamicConfig.Social = enabled
+	case CategoryGaming:
+		s.dynamicConfig.Gaming = enabled
+	case CategoryStreaming:
+		s.dynamicConfig.Streaming = enabled
+	case CategoryCustom:
+		s.dynamicConfig.Custom = enabled
+	}
+
+	log.Printf("Category %s toggled: %v", cat, enabled)
+}
+
+func (s *Server) addCustomDomain(domain string) bool {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if domain == "" || !strings.Contains(domain, ".") {
+		return false
+	}
+
+	// Remove www. and trailing dots
+	domain = strings.TrimPrefix(domain, "www.")
+	domain = strings.TrimSuffix(domain, ".")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.blocklists[CategoryCustom] == nil {
+		s.blocklists[CategoryCustom] = make(map[string]bool)
+	}
+
+	s.blocklists[CategoryCustom][domain] = true
+	log.Printf("Added custom domain: %s", domain)
+	return true
+}
+
+func (s *Server) removeCustomDomain(domain string) bool {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	domain = strings.TrimPrefix(domain, "www.")
+	domain = strings.TrimSuffix(domain, ".")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.blocklists[CategoryCustom] == nil {
+		return false
+	}
+
+	delete(s.blocklists[CategoryCustom], domain)
+	log.Printf("Removed custom domain: %s", domain)
+	return true
 }
 
 func (s *Server) loadAllBlocklists() error {
@@ -226,7 +308,6 @@ func (s *Server) loadCategoryFromURLs(cat Category, urls []string) {
 
 	s.mu.Lock()
 	if existing, ok := s.blocklists[cat]; ok {
-		// Merge with existing
 		for d := range domains {
 			existing[d] = true
 		}
@@ -247,7 +328,6 @@ func (s *Server) loadCategoryFromDomains(cat Category, domainList []string) {
 		if domain == "" || strings.HasPrefix(domain, "#") {
 			continue
 		}
-		// Remove www. prefix if present
 		domain = strings.TrimPrefix(domain, "www.")
 		domains[domain] = true
 	}
@@ -326,6 +406,11 @@ func (s *Server) checkBlock(domain string) (bool, Category, string) {
 	}
 
 	for cat, domains := range s.blocklists {
+		// Skip if category is disabled
+		if !s.isCategoryEnabled(cat) {
+			continue
+		}
+
 		if domains[domain] {
 			return true, cat, "exact match"
 		}
@@ -382,7 +467,6 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 		qtype = fmt.Sprintf("TYPE%d", question.Qtype)
 	}
 
-	// Update stats with proper locking
 	s.statsMu.Lock()
 	s.stats.TotalQueries++
 	s.statsMu.Unlock()
@@ -410,7 +494,6 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 
 	blocked, category, reason := s.checkBlock(domain)
 	if blocked {
-		// Update stats with proper locking
 		s.statsMu.Lock()
 		s.stats.BlockedQueries++
 		s.stats.ByCategory[string(category)]++
@@ -570,12 +653,41 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	// Get current toggle states
+	s.configMu.RLock()
+	toggles := map[string]bool{
+		"ads":       s.dynamicConfig.Ads,
+		"social":    s.dynamicConfig.Social,
+		"gaming":    s.dynamicConfig.Gaming,
+		"streaming": s.dynamicConfig.Streaming,
+		"custom":    s.dynamicConfig.Custom,
+	}
+	s.configMu.RUnlock()
+
 	host := r.Host
 
 	catHTML := ""
 	for cat, count := range categories {
-		catHTML += fmt.Sprintf("<div class='cat-box %s'><strong>%s</strong><br>%d domains</div>", cat, strings.ToUpper(cat), count)
+		enabled := toggles[cat]
+		statusClass := "disabled"
+		if enabled {
+			statusClass = "enabled"
+		}
+		catHTML += fmt.Sprintf("<div class='cat-box %s %s' data-category='%s'><strong>%s</strong><br>%d domains<br><span class='status'>%s</span></div>",
+			cat, statusClass, cat, strings.ToUpper(cat), count, map[bool]string{true: "ON", false: "OFF"}[enabled])
 	}
+
+	// Get custom domains for display
+	s.mu.RLock()
+	customDomains := []string{}
+	if domains, ok := s.blocklists[CategoryCustom]; ok {
+		for d := range domains {
+			customDomains = append(customDomains, d)
+		}
+	}
+	s.mu.RUnlock()
+
+	customDomainsJSON, _ := json.Marshal(customDomains)
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -620,12 +732,84 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             border-radius: 8px; 
             text-align: center;
             border: 2px solid #334155;
+            cursor: pointer;
+            transition: all 0.3s;
+            position: relative;
         }
-        .cat-box.ads { border-color: #ef4444; }
-        .cat-box.social { border-color: #8b5cf6; }
-        .cat-box.gaming { border-color: #f59e0b; }
-        .cat-box.streaming { border-color: #ec4899; }
-        .cat-box.custom { border-color: #06b6d4; }
+        .cat-box:hover { transform: translateY(-2px); }
+        .cat-box.enabled { border-color: #10b981; box-shadow: 0 0 10px rgba(16, 185, 129, 0.3); }
+        .cat-box.disabled { border-color: #64748b; opacity: 0.6; }
+        .cat-box.ads.enabled { border-color: #ef4444; box-shadow: 0 0 10px rgba(239, 68, 68, 0.3); }
+        .cat-box.social.enabled { border-color: #8b5cf6; box-shadow: 0 0 10px rgba(139, 92, 246, 0.3); }
+        .cat-box.gaming.enabled { border-color: #f59e0b; box-shadow: 0 0 10px rgba(245, 158, 11, 0.3); }
+        .cat-box.streaming.enabled { border-color: #ec4899; box-shadow: 0 0 10px rgba(236, 72, 153, 0.3); }
+        .cat-box .status { 
+            display: inline-block; 
+            padding: 2px 8px; 
+            border-radius: 12px; 
+            font-size: 0.75em; 
+            margin-top: 5px;
+            font-weight: bold;
+        }
+        .cat-box.enabled .status { background: #10b981; color: white; }
+        .cat-box.disabled .status { background: #64748b; color: white; }
+        
+        .custom-domains {
+            background: #1e293b;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .custom-domains h3 { margin-top: 0; color: #38bdf8; }
+        .domain-input {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .domain-input input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            background: #0f172a;
+            color: #e2e8f0;
+            font-size: 1em;
+        }
+        .domain-input button {
+            padding: 10px 20px;
+            background: #38bdf8;
+            color: #0f172a;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .domain-input button:hover { background: #7dd3fc; }
+        .domain-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        .domain-tag {
+            background: #334155;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .domain-tag button {
+            background: #ef4444;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            padding: 2px 6px;
+            cursor: pointer;
+            font-size: 0.75em;
+        }
         
         .logs-container { 
             background: #1e293b; 
@@ -713,14 +897,31 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .status-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%%; margin-right: 5px; }
         .status-live { background: #10b981; animation: pulse 2s infinite; }
         @keyframes pulse { 0%%, 100%% { opacity: 1; } 50%% { opacity: 0.5; } }
+        
+        .toggle-hint {
+            text-align: center;
+            color: #64748b;
+            font-size: 0.85em;
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
     <h1>🛡️ Parental Control + AdBlock <span class="badge">ACTIVE</span></h1>
-    <p class="subtitle">Block ads, social media, games, and streaming</p>
+    <p class="subtitle">Click categories to toggle ON/OFF • Add custom domains below</p>
     
-    <div class="categories">
+    <div class="categories" id="categories">
         %s
+    </div>
+    <p class="toggle-hint">💡 Click any category box above to enable/disable blocking</p>
+    
+    <div class="custom-domains">
+        <h3>➕ Custom Blocklist</h3>
+        <div class="domain-input">
+            <input type="text" id="newDomain" placeholder="Enter domain (e.g., example.com)" />
+            <button onclick="addDomain()">Add Domain</button>
+        </div>
+        <div class="domain-list" id="customDomains"></div>
     </div>
     
     <div class="grid">
@@ -740,7 +941,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 </div>
                 <div class="stat-box">
                     <div>Active Categories</div>
-                    <div class="stat-value" id="categories">%d</div>
+                    <div class="stat-value" id="activeCats">0</div>
                 </div>
             </div>
             
@@ -775,6 +976,88 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         let eventSource;
         let isPaused = false;
         let currentFilter = 'all';
+        let customDomains = %s;
+        
+        // Initialize custom domains display
+        function renderCustomDomains() {
+            const container = document.getElementById('customDomains');
+            container.innerHTML = '';
+            customDomains.forEach(domain => {
+                const tag = document.createElement('div');
+                tag.className = 'domain-tag';
+                tag.innerHTML = domain + '<button onclick="removeDomain(\'' + domain + '\')">×</button>';
+                container.appendChild(tag);
+            });
+        }
+        
+        // Toggle category
+        document.getElementById('categories').addEventListener('click', async (e) => {
+            const catBox = e.target.closest('.cat-box');
+            if (!catBox) return;
+            
+            const category = catBox.dataset.category;
+            const isEnabled = catBox.classList.contains('enabled');
+            
+            try {
+                const response = await fetch('/api/toggle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ category: category, enabled: !isEnabled })
+                });
+                
+                if (response.ok) {
+                    location.reload(); // Reload to show updated state
+                }
+            } catch (err) {
+                console.error('Toggle failed:', err);
+            }
+        });
+        
+        // Add domain
+        async function addDomain() {
+            const input = document.getElementById('newDomain');
+            const domain = input.value.trim();
+            if (!domain) return;
+            
+            try {
+                const response = await fetch('/api/custom-domain', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ domain: domain, action: 'add' })
+                });
+                
+                if (response.ok) {
+                    customDomains.push(domain);
+                    renderCustomDomains();
+                    input.value = '';
+                }
+            } catch (err) {
+                console.error('Add domain failed:', err);
+            }
+        }
+        
+        // Remove domain
+        async function removeDomain(domain) {
+            try {
+                const response = await fetch('/api/custom-domain', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ domain: domain, action: 'remove' })
+                });
+                
+                if (response.ok) {
+                    customDomains = customDomains.filter(d => d !== domain);
+                    renderCustomDomains();
+                }
+            } catch (err) {
+                console.error('Remove domain failed:', err);
+            }
+        }
+        
+        // Allow Enter key to add domain
+        document.getElementById('newDomain').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') addDomain();
+        });
         
         function connectSSE() {
             eventSource = new EventSource('/api/logs/stream');
@@ -847,6 +1130,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 document.getElementById('total').textContent = data.total_queries.toLocaleString();
                 document.getElementById('blocked').textContent = data.blocked_queries.toLocaleString();
                 document.getElementById('cached').textContent = data.cached_queries.toLocaleString();
+                
+                // Count active categories
+                const activeCats = Object.values(data.by_category).filter(v => v > 0).length;
+                document.getElementById('activeCats').textContent = activeCats;
             } catch (e) {
                 console.error('Stats error:', e);
             }
@@ -862,16 +1149,76 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             }
         }
         
+        // Initialize
+        renderCustomDomains();
         loadRecentLogs();
         connectSSE();
         updateStats();
         setInterval(updateStats, 5000);
     </script>
 </body>
-</html>`, catHTML, len(categories), host)
+</html>`, catHTML, host, string(customDomainsJSON))
 
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(html))
+}
+
+func (s *Server) handleToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Category string `json:"category"`
+		Enabled  bool   `json:"enabled"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	cat := Category(req.Category)
+	s.toggleCategory(cat, req.Enabled)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"category": req.Category,
+		"enabled":  req.Enabled,
+	})
+}
+
+func (s *Server) handleCustomDomain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Domain string `json:"domain"`
+		Action string `json:"action"` // "add" or "remove"
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	var success bool
+	if req.Action == "add" {
+		success = s.addCustomDomain(req.Domain)
+	} else if req.Action == "remove" {
+		success = s.removeCustomDomain(req.Domain)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": success,
+		"domain":  req.Domain,
+		"action":  req.Action,
+	})
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -948,7 +1295,7 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { // ✅ Fixed: was http.MethodPOST
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -1007,7 +1354,7 @@ func loadConfig() Config {
 		Social:    getEnvBool("BLOCK_SOCIAL", false),
 		Gaming:    getEnvBool("BLOCK_GAMING", false),
 		Streaming: getEnvBool("BLOCK_STREAMING", false),
-		Custom:    getEnvBool("BLOCK_CUSTOM", false),
+		Custom:    getEnvBool("BLOCK_CUSTOM", true),
 	}
 
 	return Config{
@@ -1069,6 +1416,8 @@ func main() {
 	http.HandleFunc("/api/stats", server.handleStats)
 	http.HandleFunc("/api/logs", server.handleLogs)
 	http.HandleFunc("/api/logs/stream", server.handleLogsStream)
+	http.HandleFunc("/api/toggle", server.handleToggle)
+	http.HandleFunc("/api/custom-domain", server.handleCustomDomain)
 	http.HandleFunc("/api/reload", server.handleReload)
 	http.HandleFunc("/dns-query", server.handleDoH)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
