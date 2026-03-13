@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -33,6 +32,20 @@ var defaultBlocklists = []string{
 	"https://adaway.org/hosts.txt",
 }
 
+// App blocker lists by category
+var appBlocklists = map[Category][]string{
+	CategorySocial: {
+		"https://raw.githubusercontent.com/jerryn70/Social-media-Blocklist/master/Social-media-Blocklist.txt",
+		"https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social-only/hosts",
+	},
+	CategoryGaming: {
+		"https://raw.githubusercontent.com/jerryn70/Gaming-Blocklist/master/Gaming-Blocklist.txt",
+	},
+	CategoryStreaming: {
+		"https://raw.githubusercontent.com/jerryn70/Streaming-Blocklist/master/Streaming-Blocklist.txt",
+	},
+}
+
 type LogEntry struct {
 	Timestamp string `json:"timestamp"`
 	Domain    string `json:"domain"`
@@ -53,48 +66,28 @@ type BlockConfig struct {
 }
 
 type Config struct {
-	Port             string      `json:"port"`
-	UpstreamDNS      []string    `json:"upstream_dns"`
-	Blocklists       []string    `json:"blocklists"`
-	Whitelist        []string    `json:"whitelist"`
-	CacheSize        int         `json:"cache_size"`
-	BlockConfig      BlockConfig `json:"block_config"`
-	SocialDomains    []string    `json:"-"`
-	GamingDomains    []string    `json:"-"`
-	StreamingDomains []string    `json:"-"`
-	CustomDomains    []string    `json:"-"`
-	// Render-specific settings
-	KeepAliveInterval time.Duration `json:"-"`
-	EnableKeepAlive   bool          `json:"-"`
+	Port        string      `json:"port"`
+	UpstreamDNS []string    `json:"upstream_dns"`
+	Blocklists  []string    `json:"blocklists"`
+	Whitelist   []string    `json:"whitelist"`
+	CacheSize   int         `json:"cache_size"`
+	BlockConfig BlockConfig `json:"block_config"`
 }
 
 type Server struct {
 	config     Config
-	blocklists map[Category]map[string]bool
+	blocklists map[Category]map[string]bool // category -> domains
 	whitelist  map[string]bool
 	cache      *Cache
 	upstream   []string
 	mu         sync.RWMutex
 	stats      Stats
-	statsMu    sync.Mutex
 	startTime  time.Time
 	logs       []LogEntry
 	logsMu     sync.RWMutex
 	maxLogs    int
 	clients    map[chan LogEntry]bool
 	clientsMu  sync.RWMutex
-	// Dynamic config for toggles
-	dynamicConfig BlockConfig
-	configMu      sync.RWMutex
-	// Keep-alive control
-	keepAliveCancel context.CancelFunc
-	// Last activity tracking for sleep mode
-	lastActivity time.Time
-	activityMu   sync.RWMutex
-	isSleeping   bool
-	sleepMu      sync.RWMutex
-	// Wake-up channel for instant resume
-	wakeChan chan struct{}
 }
 
 type Stats struct {
@@ -153,107 +146,19 @@ func NewServer(config Config) *Server {
 	}
 
 	return &Server{
-		config:        config,
-		dynamicConfig: config.BlockConfig,
-		blocklists:    make(map[Category]map[string]bool),
-		whitelist:     whitelist,
-		cache:         NewCache(config.CacheSize),
-		upstream:      config.UpstreamDNS,
-		startTime:     time.Now(),
-		logs:          make([]LogEntry, 0),
-		maxLogs:       1000,
-		clients:       make(map[chan LogEntry]bool),
+		config:     config,
+		blocklists: make(map[Category]map[string]bool),
+		whitelist:  whitelist,
+		cache:      NewCache(config.CacheSize),
+		upstream:   config.UpstreamDNS,
+		startTime:  time.Now(),
+		logs:       make([]LogEntry, 0),
+		maxLogs:    1000,
+		clients:    make(map[chan LogEntry]bool),
 		stats: Stats{
 			ByCategory: make(map[string]int64),
 		},
-		lastActivity: time.Now(),
-		wakeChan:     make(chan struct{}, 1),
 	}
-}
-
-// Keep-alive ping to prevent Render from sleeping
-func (s *Server) startKeepAlive() {
-	if !s.config.EnableKeepAlive {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s.keepAliveCancel = cancel
-
-	go func() {
-		ticker := time.NewTicker(s.config.KeepAliveInterval)
-		defer ticker.Stop()
-
-		client := &http.Client{Timeout: 10 * time.Second}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// Self-ping to keep Render alive
-				req, err := http.NewRequestWithContext(ctx, "GET",
-					fmt.Sprintf("http://localhost:%s/health", s.config.Port), nil)
-				if err != nil {
-					continue
-				}
-				resp, err := client.Do(req)
-				if err == nil {
-					resp.Body.Close()
-				}
-				log.Printf("Keep-alive ping sent")
-			}
-		}
-	}()
-
-	log.Printf("Keep-alive started (interval: %v)", s.config.KeepAliveInterval)
-}
-
-func (s *Server) stopKeepAlive() {
-	if s.keepAliveCancel != nil {
-		s.keepAliveCancel()
-	}
-}
-
-// Activity tracking for sleep mode
-func (s *Server) recordActivity() {
-	s.activityMu.Lock()
-	s.lastActivity = time.Now()
-	wasSleeping := s.isSleeping
-	s.isSleeping = false
-	s.activityMu.Unlock()
-
-	// If we were sleeping, wake up handlers
-	if wasSleeping {
-		select {
-		case s.wakeChan <- struct{}{}:
-		default:
-		}
-		log.Printf("Server woke up from sleep mode")
-	}
-}
-
-func (s *Server) timeSinceLastActivity() time.Duration {
-	s.activityMu.RLock()
-	defer s.activityMu.RUnlock()
-	return time.Since(s.lastActivity)
-}
-
-func (s *Server) enterSleepMode() {
-	s.sleepMu.Lock()
-	s.isSleeping = true
-	s.sleepMu.Unlock()
-
-	// Clear memory-heavy caches to save resources
-	s.cache = NewCache(s.config.CacheSize)
-
-	log.Printf("Server entered sleep mode due to inactivity")
-}
-
-func (s *Server) isServerSleeping() bool {
-	s.sleepMu.RLock()
-	defer s.sleepMu.RUnlock()
-	return s.isSleeping
 }
 
 func (s *Server) addLog(entry LogEntry) {
@@ -274,113 +179,35 @@ func (s *Server) addLog(entry LogEntry) {
 	s.clientsMu.RUnlock()
 }
 
-func (s *Server) isCategoryEnabled(cat Category) bool {
-	s.configMu.RLock()
-	defer s.configMu.RUnlock()
-
-	switch cat {
-	case CategoryAds:
-		return s.dynamicConfig.Ads
-	case CategorySocial:
-		return s.dynamicConfig.Social
-	case CategoryGaming:
-		return s.dynamicConfig.Gaming
-	case CategoryStreaming:
-		return s.dynamicConfig.Streaming
-	case CategoryCustom:
-		return s.dynamicConfig.Custom
-	}
-	return false
-}
-
-func (s *Server) toggleCategory(cat Category, enabled bool) {
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
-
-	switch cat {
-	case CategoryAds:
-		s.dynamicConfig.Ads = enabled
-	case CategorySocial:
-		s.dynamicConfig.Social = enabled
-	case CategoryGaming:
-		s.dynamicConfig.Gaming = enabled
-	case CategoryStreaming:
-		s.dynamicConfig.Streaming = enabled
-	case CategoryCustom:
-		s.dynamicConfig.Custom = enabled
-	}
-
-	log.Printf("Category %s toggled: %v", cat, enabled)
-}
-
-func (s *Server) addCustomDomain(domain string) bool {
-	domain = strings.TrimSpace(strings.ToLower(domain))
-	if domain == "" || !strings.Contains(domain, ".") {
-		return false
-	}
-
-	// Remove www. and trailing dots
-	domain = strings.TrimPrefix(domain, "www.")
-	domain = strings.TrimSuffix(domain, ".")
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.blocklists[CategoryCustom] == nil {
-		s.blocklists[CategoryCustom] = make(map[string]bool)
-	}
-
-	s.blocklists[CategoryCustom][domain] = true
-	log.Printf("Added custom domain: %s", domain)
-	return true
-}
-
-func (s *Server) removeCustomDomain(domain string) bool {
-	domain = strings.TrimSpace(strings.ToLower(domain))
-	domain = strings.TrimPrefix(domain, "www.")
-	domain = strings.TrimSuffix(domain, ".")
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.blocklists[CategoryCustom] == nil {
-		return false
-	}
-
-	delete(s.blocklists[CategoryCustom], domain)
-	log.Printf("Removed custom domain: %s", domain)
-	return true
-}
-
 func (s *Server) loadAllBlocklists() error {
 	log.Println("Loading all blocklists...")
 
-	// Load ads blocklists (from URLs)
+	// Load ads blocklists
 	if s.config.BlockConfig.Ads {
-		s.loadCategoryFromURLs(CategoryAds, s.config.Blocklists)
+		if err := s.loadCategory(CategoryAds, s.config.Blocklists); err != nil {
+			log.Printf("Failed to load ads blocklists: %v", err)
+		}
 	}
 
-	// Load social media (from URLs + env domains)
+	// Load social media
 	if s.config.BlockConfig.Social {
-		s.loadCategoryFromURLs(CategorySocial, []string{
-			"https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social-only/hosts",
-		})
-		s.loadCategoryFromDomains(CategorySocial, s.config.SocialDomains)
+		if err := s.loadCategory(CategorySocial, appBlocklists[CategorySocial]); err != nil {
+			log.Printf("Failed to load social blocklists: %v", err)
+		}
 	}
 
-	// Load gaming (from env domains only)
+	// Load gaming
 	if s.config.BlockConfig.Gaming {
-		s.loadCategoryFromDomains(CategoryGaming, s.config.GamingDomains)
+		if err := s.loadCategory(CategoryGaming, appBlocklists[CategoryGaming]); err != nil {
+			log.Printf("Failed to load gaming blocklists: %v", err)
+		}
 	}
 
-	// Load streaming (from env domains)
+	// Load streaming
 	if s.config.BlockConfig.Streaming {
-		s.loadCategoryFromDomains(CategoryStreaming, s.config.StreamingDomains)
-	}
-
-	// Load custom (from env domains)
-	if s.config.BlockConfig.Custom {
-		s.loadCategoryFromDomains(CategoryCustom, s.config.CustomDomains)
+		if err := s.loadCategory(CategoryStreaming, appBlocklists[CategoryStreaming]); err != nil {
+			log.Printf("Failed to load streaming blocklists: %v", err)
+		}
 	}
 
 	// Log summary
@@ -393,13 +220,10 @@ func (s *Server) loadAllBlocklists() error {
 	return nil
 }
 
-func (s *Server) loadCategoryFromURLs(cat Category, urls []string) {
+func (s *Server) loadCategory(cat Category, urls []string) error {
 	domains := make(map[string]bool)
 
 	for _, url := range urls {
-		if url == "" {
-			continue
-		}
 		if err := s.fetchBlocklist(url, domains); err != nil {
 			log.Printf("Failed to fetch %s: %v", url, err)
 			continue
@@ -407,42 +231,10 @@ func (s *Server) loadCategoryFromURLs(cat Category, urls []string) {
 	}
 
 	s.mu.Lock()
-	if existing, ok := s.blocklists[cat]; ok {
-		for d := range domains {
-			existing[d] = true
-		}
-	} else {
-		s.blocklists[cat] = domains
-	}
-	s.mu.Unlock()
-}
-
-func (s *Server) loadCategoryFromDomains(cat Category, domainList []string) {
-	if len(domainList) == 0 {
-		return
-	}
-
-	domains := make(map[string]bool)
-	for _, domain := range domainList {
-		domain = strings.TrimSpace(strings.ToLower(domain))
-		if domain == "" || strings.HasPrefix(domain, "#") {
-			continue
-		}
-		domain = strings.TrimPrefix(domain, "www.")
-		domains[domain] = true
-	}
-
-	s.mu.Lock()
-	if existing, ok := s.blocklists[cat]; ok {
-		for d := range domains {
-			existing[d] = true
-		}
-	} else {
-		s.blocklists[cat] = domains
-	}
+	s.blocklists[cat] = domains
 	s.mu.Unlock()
 
-	log.Printf("Loaded %d domains from environment for category %s", len(domains), cat)
+	return nil
 }
 
 func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
@@ -458,9 +250,11 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	lineCount := 0
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		lineCount++
 
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
 			continue
@@ -492,6 +286,7 @@ func (s *Server) fetchBlocklist(url string, blocklist map[string]bool) error {
 		}
 	}
 
+	log.Printf("Loaded %d domains from %s", len(blocklist), url)
 	return scanner.Err()
 }
 
@@ -505,16 +300,14 @@ func (s *Server) checkBlock(domain string) (bool, Category, string) {
 		return false, "", "whitelisted"
 	}
 
+	// Check each category
 	for cat, domains := range s.blocklists {
-		// Skip if category is disabled
-		if !s.isCategoryEnabled(cat) {
-			continue
-		}
-
+		// Exact match
 		if domains[domain] {
 			return true, cat, "exact match"
 		}
 
+		// Subdomain match
 		parts := strings.Split(domain, ".")
 		for i := 1; i < len(parts); i++ {
 			parent := strings.Join(parts[i:], ".")
@@ -528,23 +321,21 @@ func (s *Server) checkBlock(domain string) (bool, Category, string) {
 }
 
 func (s *Server) getAppName(domain string) string {
+	// Map domains to app names for better logging
 	appMap := map[string]string{
-		"roblox.com":         "Roblox",
-		"rbxcdn.com":         "Roblox",
-		"facebook.com":       "Facebook",
-		"instagram.com":      "Instagram",
-		"twitter.com":        "Twitter/X",
-		"x.com":              "Twitter/X",
-		"tiktok.com":         "TikTok",
-		"youtube.com":        "YouTube",
-		"discord.com":        "Discord",
-		"discordapp.com":     "Discord",
-		"epicgames.com":      "Epic Games",
-		"fortnite.com":       "Fortnite",
-		"minecraft.net":      "Minecraft",
-		"netflix.com":        "Netflix",
-		"steamcommunity.com": "Steam",
-		"steampowered.com":   "Steam",
+		"roblox.com":     "Roblox",
+		"rbxcdn.com":     "Roblox",
+		"facebook.com":   "Facebook",
+		"instagram.com":  "Instagram",
+		"twitter.com":    "Twitter/X",
+		"x.com":          "Twitter/X",
+		"tiktok.com":     "TikTok",
+		"youtube.com":    "YouTube",
+		"discord.com":    "Discord",
+		"discordapp.com": "Discord",
+		"epicgames.com":  "Epic Games",
+		"fortnite.com":   "Fortnite",
+		"minecraft.net":  "Minecraft",
 	}
 
 	for d, app := range appMap {
@@ -556,9 +347,6 @@ func (s *Server) getAppName(domain string) string {
 }
 
 func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool, string, Category) {
-	// Record activity to prevent sleep
-	s.recordActivity()
-
 	if len(msg.Question) == 0 {
 		return msg, false, "no question", ""
 	}
@@ -570,16 +358,12 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 		qtype = fmt.Sprintf("TYPE%d", question.Qtype)
 	}
 
-	s.statsMu.Lock()
 	s.stats.TotalQueries++
-	s.statsMu.Unlock()
 
+	// Check cache
 	cacheKey := fmt.Sprintf("%s:%d", domain, question.Qtype)
 	if cached, found := s.cache.Get(cacheKey); found {
-		s.statsMu.Lock()
 		s.stats.CachedQueries++
-		s.statsMu.Unlock()
-
 		cachedMsg := new(dns.Msg)
 		cachedMsg.Unpack(cached)
 		cachedMsg.Id = msg.Id
@@ -595,12 +379,11 @@ func (s *Server) processDNSQuery(msg *dns.Msg, clientIP string) (*dns.Msg, bool,
 		return cachedMsg, true, "cache hit", ""
 	}
 
+	// Check blocklists
 	blocked, category, reason := s.checkBlock(domain)
 	if blocked {
-		s.statsMu.Lock()
 		s.stats.BlockedQueries++
 		s.stats.ByCategory[string(category)]++
-		s.statsMu.Unlock()
 
 		msg.Rcode = dns.RcodeNameError
 		msg.Response = true
@@ -676,9 +459,6 @@ func (s *Server) forwardAndCache(msg *dns.Msg, cacheKey string, clientIP string)
 }
 
 func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
-	// Record activity
-	s.recordActivity()
-
 	clientIP := r.Header.Get("X-Forwarded-For")
 	if clientIP == "" {
 		clientIP = r.RemoteAddr
@@ -752,9 +532,6 @@ func (s *Server) forwardQuery(r *dns.Msg) (*dns.Msg, error) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	// Record activity
-	s.recordActivity()
-
 	s.mu.RLock()
 	categories := make(map[string]int)
 	for cat, domains := range s.blocklists {
@@ -762,46 +539,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	// Get current toggle states
-	s.configMu.RLock()
-	toggles := map[string]bool{
-		"ads":       s.dynamicConfig.Ads,
-		"social":    s.dynamicConfig.Social,
-		"gaming":    s.dynamicConfig.Gaming,
-		"streaming": s.dynamicConfig.Streaming,
-		"custom":    s.dynamicConfig.Custom,
-	}
-	s.configMu.RUnlock()
-
 	host := r.Host
 
+	// Build category HTML
 	catHTML := ""
 	for cat, count := range categories {
-		enabled := toggles[cat]
-		statusClass := "disabled"
-		if enabled {
-			statusClass = "enabled"
-		}
-		catHTML += fmt.Sprintf("<div class='cat-box %s %s' data-category='%s'><strong>%s</strong><br>%d domains<br><span class='status'>%s</span></div>",
-			cat, statusClass, cat, strings.ToUpper(cat), count, map[bool]string{true: "ON", false: "OFF"}[enabled])
-	}
-
-	// Get custom domains for display
-	s.mu.RLock()
-	customDomains := []string{}
-	if domains, ok := s.blocklists[CategoryCustom]; ok {
-		for d := range domains {
-			customDomains = append(customDomains, d)
-		}
-	}
-	s.mu.RUnlock()
-
-	customDomainsJSON, _ := json.Marshal(customDomains)
-
-	// Check sleep status
-	sleepStatus := ""
-	if s.isServerSleeping() {
-		sleepStatus = `<div class="sleep-banner">⚠️ Server was sleeping - resuming...</div>`
+		catHTML += fmt.Sprintf("<div class='cat-box %s'><strong>%s</strong><br>%d domains</div>", cat, strings.ToUpper(cat), count)
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
@@ -823,21 +566,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         }
         h1 { color: #38bdf8; margin-bottom: 10px; }
         .subtitle { color: #94a3b8; margin-bottom: 30px; }
-        
-        .sleep-banner {
-            background: #f59e0b;
-            color: #0f172a;
-            padding: 10px 20px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            text-align: center;
-            font-weight: bold;
-            animation: fadeOut 3s forwards;
-            animation-delay: 2s;
-        }
-        @keyframes fadeOut {
-            to { opacity: 0; visibility: hidden; }
-        }
         
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
         @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
@@ -862,83 +590,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             border-radius: 8px; 
             text-align: center;
             border: 2px solid #334155;
-            cursor: pointer;
-            transition: all 0.3s;
-            position: relative;
         }
-        .cat-box:hover { transform: translateY(-2px); }
-        .cat-box.enabled { border-color: #10b981; box-shadow: 0 0 10px rgba(16, 185, 129, 0.3); }
-        .cat-box.disabled { border-color: #64748b; opacity: 0.6; }
-        .cat-box.ads.enabled { border-color: #ef4444; box-shadow: 0 0 10px rgba(239, 68, 68, 0.3); }
-        .cat-box.social.enabled { border-color: #8b5cf6; box-shadow: 0 0 10px rgba(139, 92, 246, 0.3); }
-        .cat-box.gaming.enabled { border-color: #f59e0b; box-shadow: 0 0 10px rgba(245, 158, 11, 0.3); }
-        .cat-box.streaming.enabled { border-color: #ec4899; box-shadow: 0 0 10px rgba(236, 72, 153, 0.3); }
-        .cat-box .status { 
-            display: inline-block; 
-            padding: 2px 8px; 
-            border-radius: 12px; 
-            font-size: 0.75em; 
-            margin-top: 5px;
-            font-weight: bold;
-        }
-        .cat-box.enabled .status { background: #10b981; color: white; }
-        .cat-box.disabled .status { background: #64748b; color: white; }
-        
-        .custom-domains {
-            background: #1e293b;
-            padding: 20px;
-            border-radius: 8px;
-            margin: 20px 0;
-        }
-        .custom-domains h3 { margin-top: 0; color: #38bdf8; }
-        .domain-input {
-            display: flex;
-            gap: 10px;
-        }
-        .domain-input input {
-            flex: 1;
-            padding: 10px;
-            border: 1px solid #334155;
-            border-radius: 6px;
-            background: #0f172a;
-            color: #e2e8f0;
-            font-size: 1em;
-        }
-        .domain-input button {
-            padding: 10px 20px;
-            background: #38bdf8;
-            color: #0f172a;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: bold;
-        }
-        .domain-input button:hover { background: #7dd3fc; }
-        .domain-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            max-height: 150px;
-            overflow-y: auto;
-        }
-        .domain-tag {
-            background: #334155;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 0.9em;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .domain-tag button {
-            background: #ef4444;
-            color: white;
-            border: none;
-            border-radius: 3px;
-            padding: 2px 6px;
-            cursor: pointer;
-            font-size: 0.75em;
-        }
+        .cat-box.ads { border-color: #ef4444; }
+        .cat-box.social { border-color: #8b5cf6; }
+        .cat-box.gaming { border-color: #f59e0b; }
+        .cat-box.streaming { border-color: #ec4899; }
         
         .logs-container { 
             background: #1e293b; 
@@ -1016,7 +672,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .cat-social { background: #8b5cf6; color: white; }
         .cat-gaming { background: #f59e0b; color: #0f172a; }
         .cat-streaming { background: #ec4899; color: white; }
-        .cat-custom { background: #06b6d4; color: white; }
         .log-app { color: #64748b; font-size: 0.8em; overflow: hidden; text-overflow: ellipsis; }
         
         .config { background: #1e293b; padding: 20px; border-radius: 8px; margin: 20px 0; }
@@ -1027,48 +682,26 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         .status-live { background: #10b981; animation: pulse 2s infinite; }
         @keyframes pulse { 0%%, 100%% { opacity: 1; } 50%% { opacity: 0.5; } }
         
-        .toggle-hint {
-            text-align: center;
-            color: #64748b;
-            font-size: 0.85em;
-            margin-top: 10px;
+        .toggle-container { display: flex; gap: 15px; flex-wrap: wrap; margin: 15px 0; }
+        .toggle {
+            background: #334155;
+            padding: 10px 15px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        
-        .sleep-info {
-            background: #1e293b;
-            padding: 15px;
-            border-radius: 8px;
-            margin: 20px 0;
-            border-left: 4px solid #f59e0b;
-        }
-        .sleep-info h4 { margin: 0 0 10px 0; color: #f59e0b; }
-        .sleep-info p { margin: 5px 0; color: #94a3b8; font-size: 0.9em; }
+        .toggle.active { background: #38bdf8; color: #0f172a; }
+        .toggle input { margin: 0; }
     </style>
 </head>
 <body>
-    %s
     <h1>🛡️ Parental Control + AdBlock <span class="badge">ACTIVE</span></h1>
-    <p class="subtitle">Click categories to toggle ON/OFF • Add custom domains below</p>
+    <p class="subtitle">Block ads, social media, games, and streaming</p>
     
-    <div class="sleep-info">
-        <h4>💡 Render Free Tier Notice</h4>
-        <p>This server may sleep after 15 minutes of inactivity on Render's free tier.</p>
-        <p>First request after sleep may take 30-60 seconds to respond while the server wakes up.</p>
-        <p>Consider upgrading to Render's paid tier for 24/7 availability.</p>
-    </div>
-    
-    <div class="categories" id="categories">
+    <div class="categories">
         %s
-    </div>
-    <p class="toggle-hint">💡 Click any category box above to enable/disable blocking</p>
-    
-    <div class="custom-domains">
-        <h3>➕ Custom Blocklist</h3>
-        <div class="domain-input">
-            <input type="text" id="newDomain" placeholder="Enter domain (e.g., example.com)" />
-            <button onclick="addDomain()">Add Domain</button>
-        </div>
-        <div class="domain-list" id="customDomains"></div>
     </div>
     
     <div class="grid">
@@ -1088,7 +721,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 </div>
                 <div class="stat-box">
                     <div>Active Categories</div>
-                    <div class="stat-value" id="activeCats">0</div>
+                    <div class="stat-value" id="categories">%d</div>
                 </div>
             </div>
             
@@ -1096,6 +729,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 <h3>🔗 Setup</h3>
                 <p><strong>DoH URL:</strong><br><span class="url">https://%s/dns-query</span></p>
                 <p><strong>iOS/Android:</strong> Use AdGuard DNS app</p>
+                <p><strong>Windows/Mac:</strong> Use YogaDNS or system settings</p>
             </div>
         </div>
         
@@ -1123,104 +757,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
         let eventSource;
         let isPaused = false;
         let currentFilter = 'all';
-        let customDomains = %s;
-        let reconnectAttempts = 0;
-        let maxReconnectAttempts = 10;
-        
-        // Initialize custom domains display
-        function renderCustomDomains() {
-            const container = document.getElementById('customDomains');
-            container.innerHTML = '';
-            customDomains.forEach(domain => {
-                const tag = document.createElement('div');
-                tag.className = 'domain-tag';
-                tag.innerHTML = domain + '<button onclick="removeDomain(\'' + domain + '\')">×</button>';
-                container.appendChild(tag);
-            });
-        }
-        
-        // Toggle category
-        document.getElementById('categories').addEventListener('click', async (e) => {
-            const catBox = e.target.closest('.cat-box');
-            if (!catBox) return;
-            
-            const category = catBox.dataset.category;
-            const isEnabled = catBox.classList.contains('enabled');
-            
-            try {
-                const response = await fetch('/api/toggle', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ category: category, enabled: !isEnabled })
-                });
-                
-                if (response.ok) {
-                    location.reload();
-                }
-            } catch (err) {
-                console.error('Toggle failed:', err);
-            }
-        });
-        
-        // Add domain
-        async function addDomain() {
-            const input = document.getElementById('newDomain');
-            const domain = input.value.trim();
-            if (!domain) return;
-            
-            try {
-                const response = await fetch('/api/custom-domain', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ domain: domain, action: 'add' })
-                });
-                
-                if (response.ok) {
-                    customDomains.push(domain);
-                    renderCustomDomains();
-                    input.value = '';
-                }
-            } catch (err) {
-                console.error('Add domain failed:', err);
-            }
-        }
-        
-        // Remove domain
-        async function removeDomain(domain) {
-            try {
-                const response = await fetch('/api/custom-domain', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ domain: domain, action: 'remove' })
-                });
-                
-                if (response.ok) {
-                    customDomains = customDomains.filter(d => d !== domain);
-                    renderCustomDomains();
-                }
-            } catch (err) {
-                console.error('Remove domain failed:', err);
-            }
-        }
-        
-        // Allow Enter key to add domain
-        document.getElementById('newDomain').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') addDomain();
-        });
         
         function connectSSE() {
-            if (reconnectAttempts >= maxReconnectAttempts) {
-                console.log('Max reconnect attempts reached');
-                return;
-            }
-            
             eventSource = new EventSource('/api/logs/stream');
-            reconnectAttempts++;
-            
-            eventSource.onopen = () => {
-                console.log('SSE connected');
-                reconnectAttempts = 0; // Reset on successful connection
-            };
             
             eventSource.onmessage = (event) => {
                 if (isPaused) return;
@@ -1230,15 +769,15 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             };
             
             eventSource.onerror = (err) => {
-                console.log('SSE error, reconnecting in 5s...');
-                eventSource.close();
-                setTimeout(connectSSE, 5000);
+                console.log('SSE error, reconnecting...');
+                setTimeout(connectSSE, 3000);
             };
         }
         
         function addLogEntry(entry) {
             const logsDiv = document.getElementById('logs');
             
+            // Filter logic
             if (currentFilter === 'blocked' && entry.action !== 'blocked') return;
             if (currentFilter === 'ads' && entry.category !== 'ads') return;
             if (currentFilter === 'social' && entry.category !== 'social') return;
@@ -1291,10 +830,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
                 document.getElementById('total').textContent = data.total_queries.toLocaleString();
                 document.getElementById('blocked').textContent = data.blocked_queries.toLocaleString();
                 document.getElementById('cached').textContent = data.cached_queries.toLocaleString();
-                
-                // Count active categories
-                const activeCats = Object.values(data.by_category).filter(v => v > 0).length;
-                document.getElementById('activeCats').textContent = activeCats;
             } catch (e) {
                 console.error('Stats error:', e);
             }
@@ -1310,103 +845,34 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
             }
         }
         
-        // Initialize
-        renderCustomDomains();
         loadRecentLogs();
         connectSSE();
         updateStats();
         setInterval(updateStats, 5000);
     </script>
 </body>
-</html>`, sleepStatus, catHTML, host, string(customDomainsJSON))
+</html>`, catHTML, len(categories), host)
 
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(html))
 }
 
-func (s *Server) handleToggle(w http.ResponseWriter, r *http.Request) {
-	s.recordActivity()
-
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Category string `json:"category"`
-		Enabled  bool   `json:"enabled"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	cat := Category(req.Category)
-	s.toggleCategory(cat, req.Enabled)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":  true,
-		"category": req.Category,
-		"enabled":  req.Enabled,
-	})
-}
-
-func (s *Server) handleCustomDomain(w http.ResponseWriter, r *http.Request) {
-	s.recordActivity()
-
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Domain string `json:"domain"`
-		Action string `json:"action"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	var success bool
-	if req.Action == "add" {
-		success = s.addCustomDomain(req.Domain)
-	} else if req.Action == "remove" {
-		success = s.removeCustomDomain(req.Domain)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": success,
-		"domain":  req.Domain,
-		"action":  req.Action,
-	})
-}
-
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	s.recordActivity()
-
-	s.statsMu.Lock()
+	s.mu.RLock()
 	stats := map[string]interface{}{
 		"total_queries":   s.stats.TotalQueries,
 		"blocked_queries": s.stats.BlockedQueries,
 		"cached_queries":  s.stats.CachedQueries,
 		"uptime":          time.Since(s.startTime).Round(time.Second).String(),
 		"by_category":     s.stats.ByCategory,
-		"sleeping":        s.isServerSleeping(),
 	}
-	s.statsMu.Unlock()
+	s.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	s.recordActivity()
-
 	s.logsMu.RLock()
 	logs := make([]LogEntry, len(s.logs))
 	copy(logs, s.logs)
@@ -1417,8 +883,6 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
-	s.recordActivity()
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1467,8 +931,6 @@ func (s *Server) handleLogsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	s.recordActivity()
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1495,76 +957,23 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) startRefreshLoop() {
-	ticker := time.NewTicker(24 * time.Hour)
-	go func() {
-		for range ticker.C {
-			log.Println("Auto-refreshing blocklists...")
-			s.loadAllBlocklists()
-		}
-	}()
-}
-
-// Start sleep monitor - detects when server should enter sleep mode
-func (s *Server) startSleepMonitor() {
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			inactiveTime := s.timeSinceLastActivity()
-
-			// If inactive for 10 minutes, enter sleep mode (Render sleeps at 15)
-			if inactiveTime > 10*time.Minute && !s.isServerSleeping() {
-				s.enterSleepMode()
-			}
-		}
-	}()
-}
-
-func parseCommaSeparated(envVar string) []string {
-	value := os.Getenv(envVar)
-	if value == "" {
-		return []string{}
-	}
-
-	parts := strings.Split(value, ",")
-	var result []string
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" && !strings.HasPrefix(part, "#") {
-			result = append(result, part)
-		}
-	}
-	return result
-}
-
 func loadConfig() Config {
+	// Parse block config from env
 	blockConfig := BlockConfig{
 		Ads:       getEnvBool("BLOCK_ADS", true),
-		Social:    getEnvBool("BLOCK_SOCIAL", false),
-		Gaming:    getEnvBool("BLOCK_GAMING", false),
+		Social:    getEnvBool("BLOCK_SOCIAL", true),
+		Gaming:    getEnvBool("BLOCK_GAMING", true),
 		Streaming: getEnvBool("BLOCK_STREAMING", false),
-		Custom:    getEnvBool("BLOCK_CUSTOM", true),
+		Custom:    getEnvBool("BLOCK_CUSTOM", false),
 	}
 
-	// Parse keep-alive settings for Render
-	keepAliveInterval := getEnvDuration("KEEP_ALIVE_INTERVAL", 5*time.Minute)
-	enableKeepAlive := getEnvBool("ENABLE_KEEP_ALIVE", true)
-
 	return Config{
-		Port:              getEnv("PORT", "10000"),
-		UpstreamDNS:       []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"},
-		Blocklists:        parseCommaSeparated("BLOCKLIST_URLS"),
-		Whitelist:         parseCommaSeparated("WHITELIST_DOMAINS"),
-		CacheSize:         5000,
-		BlockConfig:       blockConfig,
-		SocialDomains:     parseCommaSeparated("SOCIAL_DOMAINS"),
-		GamingDomains:     parseCommaSeparated("GAMING_DOMAINS"),
-		StreamingDomains:  parseCommaSeparated("STREAMING_DOMAINS"),
-		CustomDomains:     parseCommaSeparated("CUSTOM_DOMAINS"),
-		KeepAliveInterval: keepAliveInterval,
-		EnableKeepAlive:   enableKeepAlive,
+		Port:        getEnv("PORT", "10000"),
+		UpstreamDNS: []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"},
+		Blocklists:  parseBlocklistURLs(),
+		Whitelist:   []string{},
+		CacheSize:   5000,
+		BlockConfig: blockConfig,
 	}
 }
 
@@ -1582,56 +991,37 @@ func getEnvBool(key string, fallback bool) bool {
 	return fallback
 }
 
-func getEnvDuration(key string, fallback time.Duration) time.Duration {
-	if value, ok := os.LookupEnv(key); ok {
-		if d, err := time.ParseDuration(value); err == nil {
-			return d
-		}
-	}
-	return fallback
-}
-
 func main() {
 	config := loadConfig()
 	server := NewServer(config)
 
 	log.Printf("Starting Parental Control + AdBlock")
-	log.Printf("Keep-alive: %v (interval: %v)", config.EnableKeepAlive, config.KeepAliveInterval)
 	log.Printf("Categories enabled:")
 	if config.BlockConfig.Ads {
 		log.Printf("  ✓ Ads")
 	}
 	if config.BlockConfig.Social {
-		log.Printf("  ✓ Social Media (%d domains from env)", len(config.SocialDomains))
+		log.Printf("  ✓ Social Media")
 	}
 	if config.BlockConfig.Gaming {
-		log.Printf("  ✓ Gaming (%d domains from env)", len(config.GamingDomains))
+		log.Printf("  ✓ Gaming")
 	}
 	if config.BlockConfig.Streaming {
-		log.Printf("  ✓ Streaming (%d domains from env)", len(config.StreamingDomains))
-	}
-	if config.BlockConfig.Custom {
-		log.Printf("  ✓ Custom (%d domains from env)", len(config.CustomDomains))
+		log.Printf("  ✓ Streaming")
 	}
 
 	if err := server.loadAllBlocklists(); err != nil {
 		log.Printf("Warning: %v", err)
 	}
-
 	server.startRefreshLoop()
-	server.startSleepMonitor()
-	server.startKeepAlive()
 
 	http.HandleFunc("/", server.handleDashboard)
 	http.HandleFunc("/api/stats", server.handleStats)
 	http.HandleFunc("/api/logs", server.handleLogs)
 	http.HandleFunc("/api/logs/stream", server.handleLogsStream)
-	http.HandleFunc("/api/toggle", server.handleToggle)
-	http.HandleFunc("/api/custom-domain", server.handleCustomDomain)
 	http.HandleFunc("/api/reload", server.handleReload)
 	http.HandleFunc("/dns-query", server.handleDoH)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		server.recordActivity()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
